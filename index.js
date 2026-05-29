@@ -34,7 +34,9 @@ const io = new Server(httpServer, {
 
 // ─── Connect DB ───────────────────────────────────────────────────────────────
 
-connectDB();
+// Connect to DB without blocking the server start
+connectDB().catch(err => console.error("DB Connection Error:", err));
+
 
 // ─── Game Managers ────────────────────────────────────────────────────────────
 
