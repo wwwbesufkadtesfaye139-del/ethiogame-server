@@ -11,7 +11,7 @@ const LudoManager = require('./managers/LudoManager');
 const registerBingoHandlers = require('./socket/bingoHandlers');
 const registerLudoHandlers = require('./socket/ludoHandlers');
 
-const PORT = parseInt(process.env.PORT, 10) || 3000;
+const PORT = process.env.PORT || 3000;
 const STALE_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
 
 // ─── App & Server Setup ───────────────────────────────────────────────────────
@@ -34,9 +34,7 @@ const io = new Server(httpServer, {
 
 // ─── Connect DB ───────────────────────────────────────────────────────────────
 
-// Connect to DB without blocking the server start
-connectDB().catch(err => console.error("DB Connection Error:", err));
-
+connectDB();
 
 // ─── Game Managers ────────────────────────────────────────────────────────────
 

@@ -1,11 +1,13 @@
 {
-  "name": "ethiogame-server",
+  "name": "telegram-gaming-platform",
   "version": "1.0.0",
-  "description": "EthioGame — Bingo & Ludo Game Server",
+  "description": "Telegram Mini App Gaming Platform — Bingo & Ludo Backend",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "bot": "node bot/index.js",
+    "bot:dev": "nodemon bot/index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -13,12 +15,10 @@
     "express": "^4.18.2",
     "mongoose": "^8.0.0",
     "socket.io": "^4.7.2",
-    "uuid": "^9.0.0"
+    "uuid": "^9.0.0",
+    "grammy": "^1.26.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
