@@ -1,92 +1,145 @@
 /**
- * ludoHandlers.js
- * ───────────────
- * Registers all Socket.io event listeners for the Ludo game.
- *
- * Socket.io Events — Client → Server:
- *   ludo:createRoom  { telegramId, username, maxPlayers, winCondition, stake }
- *   ludo:joinRoom    { telegramId, username, roomId }
- *   ludo:listRooms   (no payload)
- *   ludo:rollDice    { telegramId, roomId }
- *   ludo:movePiece   { telegramId, roomId, pieceIndex, diceValue }
- *
- * Socket.io Events — Server → Client (broadcasts):
- *   ludo:roomCreated       { roomId, maxPlayers, winCondition, stake }
- *   ludo:playerJoined      { roomId, telegramId, username, color, playerCount, maxPlayers }
- *   ludo:roomsList         { rooms: [...] }
- *   ludo:gameStarted       { roomId, players, stake, totalPool, brokerFee, winnerPrize, winCondition, currentTurnTelegramId }
- *   ludo:diceRolled        { roomId, telegramId, username, color, diceValue, currentTurnIndex }
- *   ludo:pieceMoved        { roomId, telegramId, username, color, pieceIndex, fromPosition, toPosition, diceValue, boardState }
- *   ludo:turnChanged       { roomId, currentTurnIndex, currentTurnTelegramId, username, color }
- *   ludo:rollAgain         { roomId, telegramId, message }
- *   ludo:gameOver          { roomId, winner, winnerPrize, winCondition, boardState }
- *   ludo:roomCancelled     { roomId, message }
- *   ludo:playerDisconnected { roomId, telegramId, username }
- *   ludo:error             { roomId, message }
+ * ludoHandlers.js  (FIXED v2 — uses User model statics)
+ * ───────────────────────────────────────────────────────
+ * Changes made:
+ *  1. ludo:createRoom — deducts stake atomically, sends newBalance back
+ *  2. ludo:joinRoom   — deducts stake atomically, sends newBalance back
+ *  3. ludo:movePiece  — credits winner atomically when game ends
  */
 
-const registerLudoHandlers = (socket, ludoManager) => {
+const User = require('../models/User');
+
+const registerLudoHandlers = (socket, io, ludoManager) => {
   const { id: socketId } = socket;
 
   // ── ludo:createRoom ────────────────────────────────────────────────────────
-  socket.on('ludo:createRoom', ({ telegramId, username, maxPlayers, winCondition, stake } = {}, ack) => {
+  socket.on('ludo:createRoom', async ({ telegramId, username, maxPlayers, winCondition, stake } = {}, ack) => {
     if (!telegramId || !username) {
       return safAck(ack, { success: false, message: 'Missing player identity.' });
     }
 
-    const result = ludoManager.createRoom(
-      { telegramId, username, socketId },
-      Number(maxPlayers),
-      Number(winCondition),
-      Number(stake)
-    );
+    try {
+      // ✅ STEP 1 — Check if user can afford the stake
+      const affordCheck = await User.canAffordStake(telegramId, Number(stake));
+      if (!affordCheck.canJoin) {
+        const messages = {
+          USER_NOT_FOUND:        'User not found.',
+          USER_BLOCKED:          'Your account is blocked.',
+          INSUFFICIENT_BALANCE:  `Insufficient balance. You need ${stake} Birr but have ${affordCheck.balance} Birr.`,
+        };
+        return safAck(ack, { success: false, message: messages[affordCheck.reason] || 'Cannot create room.' });
+      }
 
-    if (result.error) {
-      return safAck(ack, { success: false, message: result.error });
+      // ✅ STEP 2 — Deduct stake atomically
+      const updatedUser = await User.deductBalance(telegramId, Number(stake));
+      if (!updatedUser) {
+        return safAck(ack, { success: false, message: 'Balance deduction failed. Please try again.' });
+      }
+
+      // ✅ STEP 3 — Tell app the new balance right away
+      socket.emit('user:balanceUpdated', { balance: updatedUser.balance });
+
+      // STEP 4 — Create room (your existing logic unchanged)
+      const result = ludoManager.createRoom(
+        { telegramId, username, socketId },
+        Number(maxPlayers),
+        Number(winCondition),
+        Number(stake)
+      );
+
+      if (result.error) {
+        // ✅ Refund if room creation failed
+        await User.creditBalance(telegramId, Number(stake));
+        const refundedUser = await User.findOne({ telegramId });
+        socket.emit('user:balanceUpdated', { balance: refundedUser.balance });
+        return safAck(ack, { success: false, message: result.error });
+      }
+
+      socket.join(result.roomId);
+
+      // ✅ STEP 5 — Send newBalance in response
+      safAck(ack, {
+        success:      true,
+        roomId:       result.roomId,
+        maxPlayers:   result.room.maxPlayers,
+        winCondition: result.room.winCondition,
+        stake:        result.room.stake,
+        message:      `Room created. Waiting for ${result.room.maxPlayers - 1} more player(s). Auto-cancels in 120s.`,
+        newBalance:   updatedUser.balance, // ✅ KEY FIX
+      });
+
+      console.log(`[LudoHandlers] ${username} created room ${result.roomId}`);
+
+    } catch (err) {
+      console.error('[Ludo] createRoom error:', err);
+      safAck(ack, { success: false, message: 'Server error.' });
     }
-
-    // Creator joins the Socket.io room
-    socket.join(result.roomId);
-
-    safAck(ack, {
-      success: true,
-      roomId: result.roomId,
-      maxPlayers: result.room.maxPlayers,
-      winCondition: result.room.winCondition,
-      stake: result.room.stake,
-      message: `Room created. Waiting for ${result.room.maxPlayers - 1} more player(s). Auto-cancels in 120s.`,
-    });
-
-    console.log(`[LudoHandlers] ${username} created room ${result.roomId}`);
   });
 
   // ── ludo:joinRoom ──────────────────────────────────────────────────────────
-  socket.on('ludo:joinRoom', ({ telegramId, username, roomId } = {}, ack) => {
+  socket.on('ludo:joinRoom', async ({ telegramId, username, roomId } = {}, ack) => {
     if (!telegramId || !username || !roomId) {
       return safAck(ack, { success: false, message: 'Missing join payload.' });
     }
 
-    const joinResult = ludoManager.joinRoom(roomId, { telegramId, username, socketId });
-    if (!joinResult.success) {
-      return safAck(ack, joinResult);
+    try {
+      // ✅ Get room first to know the stake amount
+      const room = ludoManager.getRoom(roomId);
+      if (!room) return safAck(ack, { success: false, message: 'Room not found.' });
+
+      const stake = room.stake || 0;
+
+      // ✅ STEP 1 — Check if user can afford the stake
+      const affordCheck = await User.canAffordStake(telegramId, stake);
+      if (!affordCheck.canJoin) {
+        const messages = {
+          USER_NOT_FOUND:        'User not found.',
+          USER_BLOCKED:          'Your account is blocked.',
+          INSUFFICIENT_BALANCE:  `Insufficient balance. You need ${stake} Birr but have ${affordCheck.balance} Birr.`,
+        };
+        return safAck(ack, { success: false, message: messages[affordCheck.reason] || 'Cannot join.' });
+      }
+
+      // ✅ STEP 2 — Deduct stake atomically
+      const updatedUser = await User.deductBalance(telegramId, stake);
+      if (!updatedUser) {
+        return safAck(ack, { success: false, message: 'Balance deduction failed. Please try again.' });
+      }
+
+      // ✅ STEP 3 — Tell app the new balance right away
+      socket.emit('user:balanceUpdated', { balance: updatedUser.balance });
+
+      // STEP 4 — Join the room (your existing logic unchanged)
+      const joinResult = ludoManager.joinRoom(roomId, { telegramId, username, socketId });
+      if (!joinResult.success) {
+        // ✅ Refund if join failed
+        await User.creditBalance(telegramId, stake);
+        const refundedUser = await User.findOne({ telegramId });
+        socket.emit('user:balanceUpdated', { balance: refundedUser.balance });
+        return safAck(ack, joinResult);
+      }
+
+      socket.join(roomId);
+
+      // ✅ STEP 5 — Send newBalance in response
+      safAck(ack, {
+        success:    true,
+        roomId,
+        color:      joinResult.color,
+        message:    joinResult.message,
+        newBalance: updatedUser.balance, // ✅ KEY FIX
+      });
+
+    } catch (err) {
+      console.error('[Ludo] joinRoom error:', err);
+      safAck(ack, { success: false, message: 'Server error.' });
     }
-
-    socket.join(roomId);
-
-    safAck(ack, {
-      success: true,
-      roomId,
-      color: joinResult.color,
-      message: joinResult.message,
-    });
   });
 
   // ── ludo:listRooms ─────────────────────────────────────────────────────────
-  // Returns the current lobby of open rooms.
   socket.on('ludo:listRooms', (_payload, ack) => {
     const rooms = ludoManager.getOpenRooms();
     safAck(ack, { success: true, rooms });
-    // Also emit as a broadcast event for clients using listeners
     socket.emit('ludo:roomsList', { rooms });
   });
 
@@ -95,11 +148,8 @@ const registerLudoHandlers = (socket, ludoManager) => {
     if (!telegramId || !roomId) {
       return safAck(ack, { success: false, message: 'Missing payload.' });
     }
-
     const room = ludoManager.getRoom(roomId);
-    if (!room) {
-      return safAck(ack, { success: false, message: 'Room not found.' });
-    }
+    if (!room) return safAck(ack, { success: false, message: 'Room not found.' });
 
     const result = room.rollDice(telegramId);
     safAck(ack, { roomId, ...result });
@@ -112,21 +162,38 @@ const registerLudoHandlers = (socket, ludoManager) => {
     }
 
     const room = ludoManager.getRoom(roomId);
-    if (!room) {
-      return safAck(ack, { success: false, message: 'Room not found.' });
-    }
+    if (!room) return safAck(ack, { success: false, message: 'Room not found.' });
 
     const result = await room.movePiece(telegramId, Number(pieceIndex), Number(diceValue));
     safAck(ack, { roomId, ...result });
 
-    // If the game ended, clean up after a short delay
-    if (room.state === 'finished') {
+    // ✅ If game ended — credit winner using your creditBalance static
+    if (room.state === 'finished' && result.winner) {
+      try {
+        const winnerTelegramId = result.winner.telegramId || result.winner;
+        const prize = result.winnerPrize || 0;
+
+        if (prize > 0) {
+          // ✅ Credit winner atomically, marks as winning for totalWinnings stat
+          const updatedWinner = await User.creditBalance(winnerTelegramId, prize, true);
+          if (updatedWinner) {
+            // ✅ Find winner's socket and send them the new balance
+            const winnerSocketId = result.winner.socketId;
+            if (winnerSocketId) {
+              io.to(winnerSocketId).emit('user:balanceUpdated', { balance: updatedWinner.balance });
+            }
+          }
+        }
+      } catch (err) {
+        console.error('[Ludo] credit winner error:', err);
+      }
+
       setTimeout(() => ludoManager.removeRoom(roomId), 5000);
     }
   });
 };
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const safAck = (ack, data) => {
   if (typeof ack === 'function') ack(data);
