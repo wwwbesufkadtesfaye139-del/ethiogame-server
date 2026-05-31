@@ -1,69 +1,104 @@
 /**
- * bingoHandlers.js
- * ────────────────
- * Registers all Socket.io event listeners for the Bingo game.
- * Each handler validates input, interacts with BingoManager, and
- * uses acknowledgement callbacks (ack) to respond directly to the caller.
- *
- * Socket.io Events — Client → Server:
- *   bingo:join        { telegramId, username, stake }
- *   bingo:claimBingo  { telegramId, roomId }
- *
- * Socket.io Events — Server → Client (broadcasts):
- *   bingo:joined        { roomId, card, playerCount, stake }
- *   bingo:playerJoined  { roomId, playerCount, username }
- *   bingo:playerLeft    { roomId, playerCount, username }
- *   bingo:countdown     { roomId, durationMs, message }
- *   bingo:countdownCancelled { roomId, message }
- *   bingo:gameStarted   { roomId, card, stake, totalPool, brokerFee, winnerPrize, playerCount }
- *   bingo:numberDrawn   { roomId, drawnNumber, calledNumbers, remaining }
- *   bingo:claimResult   { roomId, telegramId, isWinner, pattern, message }
- *   bingo:gameOver      { roomId, winners, winnerPrize, calledNumbers }
- *   bingo:noWinner      { roomId, message }
- *   bingo:error         { roomId, message }
+ * bingoHandlers.js  (FIXED v2 — uses User model statics)
+ * ────────────────────────────────────────────────────────
+ * Changes made:
+ *  1. user:getBalance   — app fetches real balance on connect
+ *  2. bingo:join        — deducts stake atomically, sends newBalance back
+ *  3. bingo:claimBingo  — credits winnings atomically, sends newBalance back
  */
 
-const registerBingoHandlers = (socket, bingoManager) => {
+const User = require('../models/User');
+
+const registerBingoHandlers = (socket, io, bingoManager) => {
   const { id: socketId } = socket;
 
+  // ── user:getBalance ────────────────────────────────────────────────────────
+  // ✅ NEW — called by the app the moment it connects
+  // Returns the real balance straight from MongoDB
+  socket.on('user:getBalance', async ({ telegramId } = {}, ack) => {
+    if (!telegramId) {
+      return safAck(ack, { success: false, message: 'Missing telegramId.' });
+    }
+    try {
+      const user = await User.findOne({ telegramId });
+      if (!user) return safAck(ack, { success: false, message: 'User not found.' });
+      safAck(ack, { success: true, balance: user.balance });
+    } catch (err) {
+      console.error('[Bingo] getBalance error:', err);
+      safAck(ack, { success: false, message: 'Server error.' });
+    }
+  });
+
   // ── bingo:join ─────────────────────────────────────────────────────────────
-  // Player wants to join a Bingo game at a specific stake level.
-  // Server finds or creates a room and places them in it.
-  socket.on('bingo:join', ({ telegramId, username, stake } = {}, ack) => {
+  socket.on('bingo:join', async ({ telegramId, username, stake } = {}, ack) => {
     if (!telegramId || !username || !stake || isNaN(stake) || stake <= 0) {
       return safAck(ack, { success: false, message: 'Invalid join payload.' });
     }
 
-    const { room, isNew, reason } = bingoManager.findOrCreateRoom(stake);
-    if (!room) {
-      return safAck(ack, { success: false, message: reason });
+    try {
+      // ✅ STEP 1 — Check if user can afford the stake (uses your canAffordStake static)
+      const affordCheck = await User.canAffordStake(telegramId, stake);
+      if (!affordCheck.canJoin) {
+        const messages = {
+          USER_NOT_FOUND:        'User not found.',
+          USER_BLOCKED:          'Your account is blocked.',
+          INSUFFICIENT_BALANCE:  `Insufficient balance. You need ${stake} Birr but have ${affordCheck.balance} Birr.`,
+        };
+        return safAck(ack, { success: false, message: messages[affordCheck.reason] || 'Cannot join.' });
+      }
+
+      // ✅ STEP 2 — Deduct stake atomically (uses your deductBalance static)
+      const updatedUser = await User.deductBalance(telegramId, stake);
+      if (!updatedUser) {
+        return safAck(ack, { success: false, message: 'Balance deduction failed. Please try again.' });
+      }
+
+      // ✅ STEP 3 — Tell the app the new real balance right away
+      socket.emit('user:balanceUpdated', { balance: updatedUser.balance });
+
+      // STEP 4 — Find or create bingo room (your existing logic unchanged)
+      const { room, isNew, reason } = bingoManager.findOrCreateRoom(stake);
+      if (!room) {
+        // ✅ Refund if no room available
+        await User.creditBalance(telegramId, stake);
+        const refundedUser = await User.findOne({ telegramId });
+        socket.emit('user:balanceUpdated', { balance: refundedUser.balance });
+        return safAck(ack, { success: false, message: reason });
+      }
+
+      socket.join(room.roomId);
+
+      const result = room.addPlayer({ telegramId, username, socketId });
+      if (!result.success) {
+        // ✅ Refund if player couldn't be added to room
+        socket.leave(room.roomId);
+        await User.creditBalance(telegramId, stake);
+        const refundedUser = await User.findOne({ telegramId });
+        socket.emit('user:balanceUpdated', { balance: refundedUser.balance });
+        return safAck(ack, result);
+      }
+
+      _scheduleRoomCleanup(room, bingoManager);
+
+      // ✅ STEP 5 — Send newBalance in the response so app updates immediately
+      safAck(ack, {
+        success:      true,
+        roomId:       room.roomId,
+        card:         result.card,
+        playerCount:  room.getPlayerCount(),
+        stake,
+        isNewRoom:    isNew,
+        message:      'Joined Bingo room.',
+        newBalance:   updatedUser.balance, // ✅ KEY FIX
+      });
+
+    } catch (err) {
+      console.error('[Bingo] join error:', err);
+      safAck(ack, { success: false, message: 'Server error.' });
     }
-
-    // Join the Socket.io room (for broadcasting)
-    socket.join(room.roomId);
-
-    const result = room.addPlayer({ telegramId, username, socketId });
-    if (!result.success) {
-      socket.leave(room.roomId);
-      return safAck(ack, result);
-    }
-
-    // Schedule cleanup once this room finishes
-    _scheduleRoomCleanup(room, bingoManager);
-
-    safAck(ack, {
-      success: true,
-      roomId: room.roomId,
-      card: result.card,
-      playerCount: room.getPlayerCount(),
-      stake,
-      isNewRoom: isNew,
-      message: 'Joined Bingo room.',
-    });
   });
 
   // ── bingo:claimBingo ───────────────────────────────────────────────────────
-  // Player believes they have a Bingo. Server verifies server-side.
   socket.on('bingo:claimBingo', async ({ telegramId, roomId } = {}, ack) => {
     if (!telegramId || !roomId) {
       return safAck(ack, { success: false, message: 'Missing telegramId or roomId.' });
@@ -76,30 +111,39 @@ const registerBingoHandlers = (socket, bingoManager) => {
 
     const claimResult = await room.claimBingo(telegramId);
 
-    // Broadcast claim result to all players in the room
+    // ✅ If winner — credit winnings atomically using your creditBalance static
+    if (claimResult.isWinner && claimResult.winnerPrize) {
+      try {
+        const updatedWinner = await User.creditBalance(telegramId, claimResult.winnerPrize, true);
+        if (updatedWinner) {
+          // ✅ Tell winner their new balance
+          socket.emit('user:balanceUpdated', { balance: updatedWinner.balance });
+          claimResult.newBalance = updatedWinner.balance;
+        }
+      } catch (err) {
+        console.error('[Bingo] credit winnings error:', err);
+      }
+    }
+
+    // Broadcast claim result to all other players in the room
     socket.to(roomId).emit('bingo:claimResult', {
       roomId,
       telegramId,
-      isWinner: claimResult.isWinner,
-      pattern: claimResult.pattern || null,
-      message: claimResult.message,
+      isWinner:  claimResult.isWinner,
+      pattern:   claimResult.pattern || null,
+      message:   claimResult.message,
     });
 
     safAck(ack, { roomId, ...claimResult });
 
-    // If winner confirmed, clean up the room
     if (claimResult.isWinner) {
       setTimeout(() => bingoManager.removeRoom(roomId), 3000);
     }
   });
 };
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/**
- * Schedules a one-time check to remove the room after the game ends.
- * Uses polling because BingoRoom emits events but doesn't call back into the manager.
- */
 const _scheduleRoomCleanup = (room, bingoManager) => {
   const interval = setInterval(() => {
     if (room.state === 'finished') {
@@ -109,10 +153,6 @@ const _scheduleRoomCleanup = (room, bingoManager) => {
   }, 5000);
 };
 
-/**
- * Safely calls an acknowledgement callback if it exists.
- * Prevents crashes when clients don't supply a callback.
- */
 const safAck = (ack, data) => {
   if (typeof ack === 'function') ack(data);
 };
