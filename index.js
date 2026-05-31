@@ -12,7 +12,7 @@ const registerBingoHandlers = require('./socket/bingoHandlers');
 const registerLudoHandlers = require('./socket/ludoHandlers');
 
 const PORT = process.env.PORT || 3000;
-const STALE_SWEEP_INTERVAL_MS = 5 * 60 * 1000; // every 5 minutes
+const STALE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
 // ─── App & Server Setup ───────────────────────────────────────────────────────
 
@@ -41,7 +41,6 @@ connectDB();
 const bingoManager = new BingoManager(io);
 const ludoManager = new LudoManager(io);
 
-// Periodic stale-room sweep
 setInterval(() => {
   bingoManager.sweepStaleRooms();
   ludoManager.sweepStaleRooms();
@@ -49,10 +48,6 @@ setInterval(() => {
 
 // ─── REST Endpoints ───────────────────────────────────────────────────────────
 
-/**
- * GET /health
- * Quick health check for monitoring / Telegram Mini App init.
- */
 app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
@@ -62,10 +57,6 @@ app.get('/health', (_req, res) => {
   });
 });
 
-/**
- * GET /user/:telegramId
- * Fetch a user's balance and stats.
- */
 app.get('/user/:telegramId', async (req, res) => {
   try {
     const user = await User.findOne({ telegramId: req.params.telegramId });
@@ -82,11 +73,6 @@ app.get('/user/:telegramId', async (req, res) => {
   }
 });
 
-/**
- * POST /user/register
- * Register or retrieve a user by Telegram ID.
- * Body: { telegramId, username }
- */
 app.post('/user/register', async (req, res) => {
   const { telegramId, username } = req.body;
   if (!telegramId || !username) {
@@ -104,10 +90,6 @@ app.post('/user/register', async (req, res) => {
   }
 });
 
-/**
- * GET /lobby/ludo
- * Returns all open Ludo rooms for the lobby screen.
- */
 app.get('/lobby/ludo', (_req, res) => {
   res.json({ rooms: ludoManager.getOpenRooms() });
 });
@@ -117,18 +99,17 @@ app.get('/lobby/ludo', (_req, res) => {
 io.on('connection', (socket) => {
   console.log(`[Socket] Connected: ${socket.id}`);
 
-  // Register game-specific handlers
-  registerBingoHandlers(socket, bingoManager);
-  registerLudoHandlers(socket, ludoManager);
+  // ✅ FIXED — pass io as second argument so handlers can emit balance updates
+  // to specific sockets (e.g. notifying winner after game ends)
+  registerBingoHandlers(socket, io, bingoManager); // ← was: registerBingoHandlers(socket, bingoManager)
+  registerLudoHandlers(socket, io, ludoManager);   // ← was: registerLudoHandlers(socket, ludoManager)
 
-  // ── Disconnect cleanup ──────────────────────────────────────────────────
   socket.on('disconnect', (reason) => {
     console.log(`[Socket] Disconnected: ${socket.id} (${reason})`);
     bingoManager.handleDisconnect(socket.id);
     ludoManager.handleDisconnect(socket.id);
   });
 
-  // ── Global error guard ──────────────────────────────────────────────────
   socket.on('error', (err) => {
     console.error(`[Socket] Error on ${socket.id}:`, err.message);
   });
@@ -154,4 +135,4 @@ const shutdown = (signal) => {
 };
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
