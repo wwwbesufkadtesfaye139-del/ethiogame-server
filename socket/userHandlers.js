@@ -68,7 +68,7 @@ const registerUserHandlers = (socket, io) => {
       });
 
       // ✅ Notify admin using Node 18 built-in fetch — no require needed
-      const adminId = process.env.ADMIN_GROUP_ID || process.env.ADMIN_ID;
+      const adminId = process.env.ADMIN_TELEGRAM_ID || process.env.ADMIN_GROUP_ID || process.env.ADMIN_ID;
       if (adminId && process.env.BOT_TOKEN) {
         try {
           await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
