@@ -10,6 +10,7 @@ const BingoManager = require('./managers/BingoManager');
 const LudoManager = require('./managers/LudoManager');
 const registerBingoHandlers = require('./socket/bingoHandlers');
 const registerLudoHandlers = require('./socket/ludoHandlers');
+const registerUserHandlers = require('./socket/userHandlers');
 
 const PORT = process.env.PORT || 3000;
 const STALE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
@@ -103,6 +104,7 @@ io.on('connection', (socket) => {
   // to specific sockets (e.g. notifying winner after game ends)
   registerBingoHandlers(socket, io, bingoManager); // ← was: registerBingoHandlers(socket, bingoManager)
   registerLudoHandlers(socket, io, ludoManager);   // ← was: registerLudoHandlers(socket, ludoManager)
+  registerUserHandlers(socket, io);
 
   socket.on('disconnect', (reason) => {
     console.log(`[Socket] Disconnected: ${socket.id} (${reason})`);
