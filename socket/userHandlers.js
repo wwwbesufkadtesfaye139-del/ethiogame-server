@@ -1,13 +1,9 @@
-// ✅ ADD THESE to your ethiogame-server socket/bingoHandlers.js
-// or create a new file socket/userHandlers.js and register it in index.js
-
 const User        = require('../models/User');
 const Transaction = require('../models/Transaction');
 
 const registerUserHandlers = (socket, io) => {
 
   // ── user:getBalance ────────────────────────────────────────────────────────
-  // Called by frontend on connect to get real balance
   socket.on('user:getBalance', async ({ telegramId } = {}, cb) => {
     if (!telegramId) return cb?.({ success: false });
     try {
@@ -21,7 +17,6 @@ const registerUserHandlers = (socket, io) => {
   });
 
   // ── user:getTransactions ───────────────────────────────────────────────────
-  // Called by WalletScreen to get real transaction history
   socket.on('user:getTransactions', async ({ telegramId } = {}, cb) => {
     if (!telegramId) return cb?.({ success: false });
     try {
@@ -36,7 +31,6 @@ const registerUserHandlers = (socket, io) => {
   });
 
   // ── user:requestWithdraw ───────────────────────────────────────────────────
-  // Called by WithdrawScreen when user submits withdraw request
   socket.on('user:requestWithdraw', async ({ telegramId, amount, phone } = {}, cb) => {
     if (!telegramId || !amount || !phone) {
       return cb?.({ success: false, message: 'Missing required fields' });
@@ -73,12 +67,10 @@ const registerUserHandlers = (socket, io) => {
         telebirrReference: phone,
       });
 
-      // Notify admin
+      // ✅ Notify admin using Node 18 built-in fetch — no require needed
       const adminId = process.env.ADMIN_GROUP_ID || process.env.ADMIN_ID;
-      if (adminId) {
+      if (adminId && process.env.BOT_TOKEN) {
         try {
-          // Use the bot token to send admin notification
-          const fetch = require('node-fetch');
           await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
