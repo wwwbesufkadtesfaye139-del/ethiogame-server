@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 
 /**
- * User Model
+ * User Model (UPDATED — added lockedBalance for withdrawal locking)
  * ──────────
  * Central identity and wallet record for every player.
  * All monetary values are in Ethiopian Birr (ETB).
@@ -32,6 +32,12 @@ const UserSchema = new mongoose.Schema(
       default: 0,
       min: [0, 'Balance cannot be negative.'],
     },
+    // ✅ NEW — amount locked for a pending withdrawal
+    lockedBalance: {
+      type: Number,
+      default: 0,
+      min: [0, 'Locked balance cannot be negative.'],
+    },
 
     // ── Lifetime stats ─────────────────────────────────────────────────────
     totalDeposited: { type: Number, default: 0 },
@@ -57,14 +63,29 @@ UserSchema.virtual('displayName').get(function () {
   return this.username || this.firstName || `User_${this.telegramId}`;
 });
 
+// ✅ NEW — shows how much is actually available to play with
+UserSchema.virtual('availableBalance').get(function () {
+  return +(this.balance - (this.lockedBalance || 0)).toFixed(2);
+});
+
 // ─── Statics ──────────────────────────────────────────────────────────────────
 
 /**
  * Atomically deducts amount. Returns null if balance insufficient or user blocked.
+ * ✅ Uses available balance (balance - lockedBalance)
  */
 UserSchema.statics.deductBalance = async function (telegramId, amount) {
   return this.findOneAndUpdate(
-    { telegramId, balance: { $gte: amount }, isBlocked: false },
+    {
+      telegramId,
+      isBlocked: false,
+      $expr: {
+        $gte: [
+          { $subtract: ['$balance', { $ifNull: ['$lockedBalance', 0] }] },
+          amount,
+        ],
+      },
+    },
     { $inc: { balance: -amount } },
     { new: true }
   );
@@ -85,20 +106,71 @@ UserSchema.statics.creditBalance = async function (telegramId, amount, isWinning
 
 /**
  * Returns a detailed affordability check without mutating any data.
+ * ✅ Uses available balance (balance - lockedBalance)
  */
 UserSchema.statics.canAffordStake = async function (telegramId, stakeAmount) {
   const user = await this.findOne({ telegramId });
-  if (!user)               return { canJoin: false, reason: 'USER_NOT_FOUND' };
-  if (user.isBlocked)      return { canJoin: false, reason: 'USER_BLOCKED',            balance: user.balance };
-  if (user.balance < stakeAmount) {
+  if (!user)          return { canJoin: false, reason: 'USER_NOT_FOUND' };
+  if (user.isBlocked) return { canJoin: false, reason: 'USER_BLOCKED', balance: user.balance };
+  const available = user.balance - (user.lockedBalance || 0);
+  if (available < stakeAmount) {
     return {
-      canJoin: false,
-      reason: 'INSUFFICIENT_BALANCE',
-      balance: user.balance,
-      shortfall: +(stakeAmount - user.balance).toFixed(2),
+      canJoin:   false,
+      reason:    'INSUFFICIENT_BALANCE',
+      balance:   available,
+      shortfall: +(stakeAmount - available).toFixed(2),
     };
   }
-  return { canJoin: true, balance: user.balance };
+  return { canJoin: true, balance: available };
+};
+
+/**
+ * ✅ NEW — Lock amount for a pending withdrawal.
+ * Money stays in balance but cannot be used for games.
+ */
+UserSchema.statics.lockForWithdrawal = async function (telegramId, amount) {
+  return this.findOneAndUpdate(
+    {
+      telegramId,
+      isBlocked: false,
+      $expr: {
+        $gte: [
+          { $subtract: ['$balance', { $ifNull: ['$lockedBalance', 0] }] },
+          amount,
+        ],
+      },
+    },
+    { $inc: { lockedBalance: amount } },
+    { new: true }
+  );
+};
+
+/**
+ * ✅ NEW — Approve withdrawal: deduct balance AND remove lock atomically.
+ */
+UserSchema.statics.approveWithdrawal = async function (telegramId, amount) {
+  return this.findOneAndUpdate(
+    { telegramId },
+    {
+      $inc: {
+        balance:        -amount,
+        lockedBalance:  -amount,
+        totalWithdrawn:  amount,
+      },
+    },
+    { new: true }
+  );
+};
+
+/**
+ * ✅ NEW — Reject withdrawal: just unlock the amount, keep balance unchanged.
+ */
+UserSchema.statics.rejectWithdrawal = async function (telegramId, amount) {
+  return this.findOneAndUpdate(
+    { telegramId },
+    { $inc: { lockedBalance: -amount } },
+    { new: true }
+  );
 };
 
 module.exports = mongoose.model('User', UserSchema);
