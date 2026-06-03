@@ -30,13 +30,39 @@ const registerUserHandlers = (socket, io) => {
     }
   });
 
+  // ── server:getStats ────────────────────────────────────────────────────────
+  socket.on('server:getStats', async (_data, cb) => {
+    try {
+      // Get live room counts from global managers
+      const bingoRooms = global.bingoManager ? global.bingoManager.getRoomCount() : 0;
+      const ludoRooms  = global.ludoManager  ? global.ludoManager.getRoomCount()  : 0;
+      const liveRooms  = bingoRooms + ludoRooms;
+
+      // Get online count
+      const onlineCount = io.engine.clientsCount || 0;
+
+      // Get total paid today
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const paidResult = await Transaction.aggregate([
+        { $match: { type: 'withdrawal', status: 'approved', createdAt: { $gte: today } } },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]);
+      const paidToday = paidResult[0]?.total || 0;
+
+      cb?.({ success: true, liveRooms, online: onlineCount, paidToday });
+    } catch (err) {
+      console.error('[userHandlers] getStats error:', err.message);
+      cb?.({ success: false, liveRooms: 0, online: 0, paidToday: 0 });
+    }
+  });
+
   // ── user:requestWithdraw ───────────────────────────────────────────────────
   socket.on('user:requestWithdraw', async ({ telegramId, amount, phone } = {}, cb) => {
     if (!telegramId || !amount || !phone) {
       return cb?.({ success: false, message: 'Missing required fields' });
     }
     try {
-      // Check for existing pending withdrawal
       const existing = await Transaction.findOne({
         telegramId: String(telegramId),
         type:   'withdrawal',
@@ -50,13 +76,11 @@ const registerUserHandlers = (socket, io) => {
         });
       }
 
-      // Lock the amount in user balance
       const updatedUser = await User.lockForWithdrawal(String(telegramId), amount);
       if (!updatedUser) {
         return cb?.({ success: false, message: 'Insufficient balance or account blocked.' });
       }
 
-      // Save transaction
       const txn = await Transaction.create({
         userId:            updatedUser._id,
         telegramId:        String(telegramId),
@@ -67,8 +91,8 @@ const registerUserHandlers = (socket, io) => {
         telebirrReference: phone,
       });
 
-      // ✅ Notify admin using Node 18 built-in fetch — no require needed
-      const adminId = process.env.ADMIN_GROUP_ID || process.env.ADMIN_ID;
+      // ✅ Notify admin using Node 18 built-in fetch
+      const adminId = process.env.ADMIN_TELEGRAM_ID || process.env.ADMIN_GROUP_ID || process.env.ADMIN_ID;
       if (adminId && process.env.BOT_TOKEN) {
         try {
           await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
@@ -92,7 +116,6 @@ const registerUserHandlers = (socket, io) => {
         }
       }
 
-      // Send updated balance to user
       socket.emit('user:balanceUpdated', {
         balance: updatedUser.balance - (updatedUser.lockedBalance || 0),
       });
@@ -108,34 +131,3 @@ const registerUserHandlers = (socket, io) => {
 };
 
 module.exports = registerUserHandlers;
-
-
-  // ── server:getStats ────────────────────────────────────────────────────────
-  // Called by HomeScreen to get real live stats
-  socket.on('server:getStats', async (_data, cb) => {
-    try {
-      const Transaction = require('../models/Transaction');
-
-      // Get live room counts from managers
-      const bingoRooms  = global.bingoManager  ? global.bingoManager.getRoomCount()  : 0;
-      const ludoRooms   = global.ludoManager    ? global.ludoManager.getRoomCount()   : 0;
-      const liveRooms   = bingoRooms + ludoRooms;
-
-      // Get online count (connected sockets)
-      const onlineCount = io.engine.clientsCount || 0;
-
-      // Get total paid today from DB
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const paidResult = await Transaction.aggregate([
-        { $match: { type: 'withdrawal', status: 'approved', createdAt: { $gte: today } } },
-        { $group: { _id: null, total: { $sum: '$amount' } } },
-      ]);
-      const paidToday = paidResult[0]?.total || 0;
-
-      cb?.({ success: true, liveRooms, online: onlineCount, paidToday });
-    } catch (err) {
-      console.error('[userHandlers] getStats error:', err.message);
-      cb?.({ success: false, liveRooms: 0, online: 0, paidToday: 0 });
-    }
-  });
