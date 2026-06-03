@@ -68,7 +68,7 @@ const registerUserHandlers = (socket, io) => {
       });
 
       // ✅ Notify admin using Node 18 built-in fetch — no require needed
-      const adminId = process.env.ADMIN_TELEGRAM_ID || process.env.ADMIN_GROUP_ID || process.env.ADMIN_ID;
+      const adminId = process.env.ADMIN_GROUP_ID || process.env.ADMIN_ID;
       if (adminId && process.env.BOT_TOKEN) {
         try {
           await fetch(`https://api.telegram.org/bot${process.env.BOT_TOKEN}/sendMessage`, {
@@ -108,3 +108,34 @@ const registerUserHandlers = (socket, io) => {
 };
 
 module.exports = registerUserHandlers;
+
+
+  // ── server:getStats ────────────────────────────────────────────────────────
+  // Called by HomeScreen to get real live stats
+  socket.on('server:getStats', async (_data, cb) => {
+    try {
+      const Transaction = require('../models/Transaction');
+
+      // Get live room counts from managers
+      const bingoRooms  = global.bingoManager  ? global.bingoManager.getRoomCount()  : 0;
+      const ludoRooms   = global.ludoManager    ? global.ludoManager.getRoomCount()   : 0;
+      const liveRooms   = bingoRooms + ludoRooms;
+
+      // Get online count (connected sockets)
+      const onlineCount = io.engine.clientsCount || 0;
+
+      // Get total paid today from DB
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      const paidResult = await Transaction.aggregate([
+        { $match: { type: 'withdrawal', status: 'approved', createdAt: { $gte: today } } },
+        { $group: { _id: null, total: { $sum: '$amount' } } },
+      ]);
+      const paidToday = paidResult[0]?.total || 0;
+
+      cb?.({ success: true, liveRooms, online: onlineCount, paidToday });
+    } catch (err) {
+      console.error('[userHandlers] getStats error:', err.message);
+      cb?.({ success: false, liveRooms: 0, online: 0, paidToday: 0 });
+    }
+  });
