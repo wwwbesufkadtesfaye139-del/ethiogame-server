@@ -41,6 +41,8 @@ connectDB();
 
 const bingoManager = new BingoManager(io);
 const ludoManager = new LudoManager(io);
+global.bingoManager = bingoManager;
+global.ludoManager  = ludoManager;
 
 setInterval(() => {
   bingoManager.sweepStaleRooms();
