@@ -30,13 +30,19 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
   });
 
   // ── bingo:join ─────────────────────────────────────────────────────────────
-  socket.on('bingo:join', async ({ telegramId, username, stake } = {}, ack) => {
+  socket.on('bingo:join', async ({ telegramId, username, stake, pickedNumber } = {}, ack) => {
     if (!telegramId || !username || !stake || isNaN(stake) || stake <= 0) {
       return safAck(ack, { success: false, message: 'Invalid join payload.' });
     }
 
+    // ✅ Validate pickedNumber 1-200
+    const picked = Number(pickedNumber);
+    if (!picked || picked < 1 || picked > 200) {
+      return safAck(ack, { success: false, message: 'Please pick a number between 1 and 200.' });
+    }
+
     try {
-      // ✅ STEP 1 — Check if user can afford the stake (uses your canAffordStake static)
+      // ✅ STEP 1 — Check if user can afford the stake
       const affordCheck = await User.canAffordStake(telegramId, stake);
       if (!affordCheck.canJoin) {
         const messages = {
@@ -47,7 +53,7 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
         return safAck(ack, { success: false, message: messages[affordCheck.reason] || 'Cannot join.' });
       }
 
-      // ✅ STEP 2 — Deduct stake atomically (uses your deductBalance static)
+      // ✅ STEP 2 — Deduct stake atomically
       const updatedUser = await User.deductBalance(telegramId, stake);
       if (!updatedUser) {
         return safAck(ack, { success: false, message: 'Balance deduction failed. Please try again.' });
@@ -56,10 +62,9 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
       // ✅ STEP 3 — Tell the app the new real balance right away
       socket.emit('user:balanceUpdated', { balance: updatedUser.balance });
 
-      // STEP 4 — Find or create bingo room (your existing logic unchanged)
+      // STEP 4 — Find or create bingo room
       const { room, isNew, reason } = bingoManager.findOrCreateRoom(stake);
       if (!room) {
-        // ✅ Refund if no room available
         await User.creditBalance(telegramId, stake);
         const refundedUser = await User.findOne({ telegramId });
         socket.emit('user:balanceUpdated', { balance: refundedUser.balance });
@@ -68,9 +73,9 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
 
       socket.join(room.roomId);
 
-      const result = room.addPlayer({ telegramId, username, socketId });
+      // ✅ Pass pickedNumber to addPlayer
+      const result = room.addPlayer({ telegramId, username, socketId, pickedNumber: picked });
       if (!result.success) {
-        // ✅ Refund if player couldn't be added to room
         socket.leave(room.roomId);
         await User.creditBalance(telegramId, stake);
         const refundedUser = await User.findOne({ telegramId });
@@ -140,6 +145,14 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
       setTimeout(() => bingoManager.removeRoom(roomId), 3000);
     }
   });
+
+  // ── bingo:listRooms ────────────────────────────────────────────────────────
+  // ✅ Returns one room per stake amount
+  socket.on('bingo:listRooms', (_payload, ack) => {
+    const rooms = bingoManager.getActiveRooms();
+    safAck(ack, { success: true, rooms });
+  });
+
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
