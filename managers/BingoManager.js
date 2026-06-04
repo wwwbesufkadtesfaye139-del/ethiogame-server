@@ -1,22 +1,23 @@
 const { v4: uuidv4 } = require('uuid');
 const BingoRoom = require('../rooms/BingoRoom');
 
-const MAX_BINGO_ROOMS = 200;
+const STAKE_OPTIONS = [10, 20, 50, 100, 200]; // ✅ fixed stake tiers
 
 /**
  * BingoManager
  * ────────────
- * Central registry for all active Bingo rooms.
- * Enforces the 200-room cap and provides smart room matching:
- * a player joining a specific stake tier is placed into an existing
- * 'waiting' or 'countdown' room first; a new room is only created
- * when none is available.
+ * ✅ ONE room per stake amount
+ * When a player joins a stake tier, they always go into the same room
+ * until that room fills (200 players) or the game starts.
+ * After the game ends, a new room is created for that stake tier.
  */
 class BingoManager {
   constructor(io) {
     this.io = io;
-    /** @type {Map<string, BingoRoom>} */
+    /** @type {Map<string, BingoRoom>} roomId → BingoRoom */
     this.rooms = new Map();
+    /** @type {Map<number, string>} stake → roomId (active waiting/countdown room) */
+    this.stakeRooms = new Map();
   }
 
   // ─── Room Lookup ──────────────────────────────────────────────────────────
@@ -29,63 +30,65 @@ class BingoManager {
     return this.rooms.size;
   }
 
-  // ─── Join or Create ───────────────────────────────────────────────────────
+  // ✅ Get all current waiting/countdown rooms (one per stake)
+  getActiveRooms() {
+    return STAKE_OPTIONS.map((stake) => {
+      const roomId = this.stakeRooms.get(stake);
+      const room   = roomId ? this.rooms.get(roomId) : null;
+      return {
+        stake,
+        roomId:      room?.roomId || null,
+        playerCount: room?.getPlayerCount() || 0,
+        state:       room?.state || 'waiting',
+        isAvailable: !room || room.state === 'waiting' || room.state === 'countdown',
+      };
+    });
+  }
 
-  /**
-   * Finds an available room for the given stake, or creates one.
-   * Returns null with a reason if capacity is reached.
-   *
-   * @param {number} stake
-   * @returns {{ room: BingoRoom, isNew: boolean } | { room: null, reason: string }}
-   */
+  // ─── Find or Create Room (ONE per stake) ─────────────────────────────────
+
   findOrCreateRoom(stake) {
-    // Try to find an existing open room with the same stake
-    for (const room of this.rooms.values()) {
-      if (
-        room.stake === stake &&
-        (room.state === 'waiting' || room.state === 'countdown')
-      ) {
-        return { room, isNew: false };
+    // Check if there's already an open room for this stake
+    const existingRoomId = this.stakeRooms.get(stake);
+    if (existingRoomId) {
+      const existingRoom = this.rooms.get(existingRoomId);
+      if (existingRoom && (existingRoom.state === 'waiting' || existingRoom.state === 'countdown')) {
+        return { room: existingRoom, isNew: false };
       }
     }
 
-    // No open room found — create a new one
-    if (this.rooms.size >= MAX_BINGO_ROOMS) {
-      return { room: null, reason: 'Server is at full capacity (200 rooms). Please try again shortly.' };
-    }
-
-    const roomId = `bingo_${uuidv4()}`;
-    const room = new BingoRoom(roomId, stake, this.io);
+    // No open room — create a new one for this stake tier
+    const roomId = `bingo_${stake}_${uuidv4()}`;
+    const room   = new BingoRoom(roomId, stake, this.io);
     this.rooms.set(roomId, room);
-    console.log(`[BingoManager] Created room ${roomId} (stake: ${stake} Birr). Total rooms: ${this.rooms.size}`);
+    this.stakeRooms.set(stake, roomId); // ✅ register as the active room for this stake
+
+    console.log(`[BingoManager] Created room ${roomId} (stake: ${stake} Birr).`);
     return { room, isNew: true };
   }
 
   // ─── Cleanup ──────────────────────────────────────────────────────────────
 
-  /**
-   * Removes a finished or empty room from the registry.
-   * Should be called after 'bingo:gameOver' or 'bingo:noWinner' events.
-   *
-   * @param {string} roomId
-   */
   removeRoom(roomId) {
     const room = this.rooms.get(roomId);
     if (room) {
+      // Remove from stakeRooms if this was the active room for its stake
+      if (this.stakeRooms.get(room.stake) === roomId) {
+        this.stakeRooms.delete(room.stake);
+      }
       room.destroy();
       this.rooms.delete(roomId);
-      console.log(`[BingoManager] Removed room ${roomId}. Total rooms: ${this.rooms.size}`);
+      console.log(`[BingoManager] Removed room ${roomId}.`);
     }
   }
 
-  /**
-   * Sweep stale rooms — rooms that are 'finished' or 'waiting' and empty.
-   * Call this periodically (e.g. every 5 minutes) to prevent leaks.
-   */
   sweepStaleRooms() {
     let swept = 0;
     for (const [roomId, room] of this.rooms.entries()) {
       if (room.state === 'finished' || (room.state === 'waiting' && room.isEmpty())) {
+        if (this.stakeRooms.get(room.stake) === roomId) {
+          this.stakeRooms.delete(room.stake);
+        }
         room.destroy();
         this.rooms.delete(roomId);
         swept++;
@@ -94,12 +97,6 @@ class BingoManager {
     if (swept) console.log(`[BingoManager] Swept ${swept} stale room(s).`);
   }
 
-  /**
-   * Given a socket that disconnected, find their room and remove them.
-   * Removes the room if it becomes empty and finished.
-   *
-   * @param {string} socketId
-   */
   handleDisconnect(socketId) {
     for (const [roomId, room] of this.rooms.entries()) {
       const hadPlayer = room.players.some((p) => p.socketId === socketId);
