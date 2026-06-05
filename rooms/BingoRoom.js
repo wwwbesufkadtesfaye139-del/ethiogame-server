@@ -1,28 +1,23 @@
 const { generateBingoCard, generateDrawPool, verifyBingoWin } = require('../services/BingoVerifier');
-const { calculatePrize, collectStakes, refundStakes, disburseWinnings } = require('../services/BrokerService');
+const { calculatePrize, refundStakes, disburseWinnings } = require('../services/BrokerService');
+const User        = require('../models/User');
 const GameHistory = require('../models/GameHistory');
 
-const COUNTDOWN_DURATION_MS  = 60_000; // 60 seconds for more players to join
-const NUMBER_DRAW_INTERVAL_MS = 4_000; // draw a number every 4 seconds
-const MIN_PLAYERS_TO_START   = 2;
-const MAX_PLAYERS_PER_ROOM   = 200;    // ✅ up to 200 players per room
+const COUNTDOWN_DURATION_MS  = 60_000; // 60s for more players to join
+const NUMBER_DRAW_INTERVAL_MS = 4_000; // draw a number every 4s
+const MIN_PLAYERS_TO_START   = 2;      // minimum unique players (not cards)
+const TOTAL_CARDS            = 200;    // always 200 cards per room
 
 /**
- * BingoRoom
- * ─────────
- * Rules:
- *   - One room per stake amount
- *   - Player picks a number 1-200 when joining
- *   - Each player gets a random 5x5 bingo card
- *   - Countdown starts when 2nd player joins
- *   - Up to 200 players can join before countdown ends
- *   - Game starts after countdown finishes
- *
- * Lifecycle:
- *   'waiting'   → open, awaiting 2nd player
- *   'countdown' → 2+ players joined, 60s window for more
- *   'active'    → numbers drawing
- *   'finished'  → winner found or all numbers exhausted
+ * BingoRoom — New System
+ * ──────────────────────
+ * - 200 pre-generated cards (1-200) per room
+ * - Players browse cards, preview them, buy one or more
+ * - Each card costs one stake
+ * - Countdown starts when 2nd PLAYER (not card) joins
+ * - Up to 200 cards can be bought before countdown ends
+ * - Game starts after countdown finishes
+ * - Winner = player whose ANY card gets bingo first
  */
 class BingoRoom {
   constructor(roomId, stake, io) {
@@ -30,7 +25,16 @@ class BingoRoom {
     this.stake  = stake;
     this.io     = io;
 
-    this.players       = [];
+    // Pre-generate all 200 cards on room creation
+    // cards: Map<cardNumber(1-200), { card: number[][], owner: telegramId|null }>
+    this.cards = new Map();
+    for (let i = 1; i <= TOTAL_CARDS; i++) {
+      this.cards.set(i, { cardNumber: i, card: generateBingoCard(), owner: null });
+    }
+
+    // Players: Map<telegramId, { username, socketId, ownedCards: number[] }>
+    this.players = new Map();
+
     this.calledNumbers = [];
     this.drawPool      = [];
     this.state         = 'waiting';
@@ -44,80 +48,103 @@ class BingoRoom {
     this._countdownEnd   = null;
   }
 
-  // ─── Public API ─────────────────────────────────────────────────────────────
+  // ─── Get all 200 cards for lobby display ──────────────────────────────────
+
+  getCardsInfo() {
+    return Array.from(this.cards.values()).map(({ cardNumber, card, owner }) => ({
+      cardNumber,
+      card,
+      isTaken: owner !== null,
+      owner,
+    }));
+  }
+
+  getCardInfo(cardNumber) {
+    return this.cards.get(cardNumber) || null;
+  }
+
+  // ─── Buy card(s) ──────────────────────────────────────────────────────────
 
   /**
-   * Adds a player to the room.
-   * playerInfo: { telegramId, username, socketId, pickedNumber }
-   * pickedNumber: 1-200, chosen by the player
+   * Player buys one card by cardNumber
+   * Balance is already deducted before calling this
    */
-  addPlayer(playerInfo) {
+  buyCard(telegramId, username, socketId, cardNumber) {
     if (this.state === 'finished') {
       return { success: false, message: 'Game already finished.' };
     }
     if (this.state === 'active') {
       return { success: false, message: 'Game already in progress. Wait for next round.' };
     }
-    if (this.players.length >= MAX_PLAYERS_PER_ROOM) {
-      return { success: false, message: 'Room is full (200 players max).' };
-    }
-    if (this.players.find((p) => p.telegramId === playerInfo.telegramId)) {
-      return { success: false, message: 'You are already in this room.' };
-    }
 
-    // ✅ Validate picked number 1-200
-    const pickedNumber = Number(playerInfo.pickedNumber);
-    if (!pickedNumber || pickedNumber < 1 || pickedNumber > 200) {
-      return { success: false, message: 'Please pick a number between 1 and 200.' };
+    const cardInfo = this.cards.get(cardNumber);
+    if (!cardInfo) {
+      return { success: false, message: 'Invalid card number.' };
+    }
+    if (cardInfo.owner !== null) {
+      return { success: false, message: `Card #${cardNumber} is already taken.` };
     }
 
-    // ✅ Generate random 5x5 bingo card
-    const card = generateBingoCard();
+    // Mark card as owned
+    cardInfo.owner = telegramId;
 
-    this.players.push({ ...playerInfo, card, pickedNumber });
+    // Add or update player
+    if (!this.players.has(telegramId)) {
+      this.players.set(telegramId, { username, socketId, ownedCards: [cardNumber] });
+    } else {
+      this.players.get(telegramId).ownedCards.push(cardNumber);
+    }
 
     console.log(
-      `[BingoRoom ${this.roomId}] Player joined: ${playerInfo.username} ` +
-      `(picked: ${pickedNumber}, total: ${this.players.length})`
+      `[BingoRoom ${this.roomId}] ${username} bought card #${cardNumber}. ` +
+      `Total players: ${this.players.size}`
     );
 
-    // Broadcast updated player count
-    this.io.to(this.roomId).emit('bingo:playerJoined', {
+    // Broadcast card taken
+    this.io.to(this.roomId).emit('bingo:cardTaken', {
       roomId:      this.roomId,
-      playerCount: this.players.length,
-      username:    playerInfo.username,
+      cardNumber,
+      playerCount: this.players.size,
     });
 
-    // ✅ Start countdown when 2nd player joins
-    if (this.players.length === MIN_PLAYERS_TO_START && this.state === 'waiting') {
+    // ✅ Start countdown when 2nd unique player joins
+    if (this.players.size === MIN_PLAYERS_TO_START && this.state === 'waiting') {
       this._startCountdown();
     }
 
-    return { success: true, message: 'Joined room.', card };
+    return { success: true, message: `Card #${cardNumber} purchased!`, card: cardInfo.card };
   }
 
   removePlayer(socketId) {
-    const idx = this.players.findIndex((p) => p.socketId === socketId);
-    if (idx === -1) return;
+    for (const [telegramId, player] of this.players.entries()) {
+      if (player.socketId === socketId) {
+        // Only remove if game hasn't started
+        if (this.state === 'waiting' || this.state === 'countdown') {
+          // Free up their cards
+          for (const cardNumber of player.ownedCards) {
+            const cardInfo = this.cards.get(cardNumber);
+            if (cardInfo) cardInfo.owner = null;
+          }
+          this.players.delete(telegramId);
 
-    const [removed] = this.players.splice(idx, 1);
-    console.log(`[BingoRoom ${this.roomId}] Player left: ${removed.username}`);
+          this.io.to(this.roomId).emit('bingo:playerLeft', {
+            roomId:      this.roomId,
+            playerCount: this.players.size,
+            username:    player.username,
+          });
 
-    if (this.state === 'waiting' || this.state === 'countdown') {
-      this.io.to(this.roomId).emit('bingo:playerLeft', {
-        roomId:      this.roomId,
-        playerCount: this.players.length,
-        username:    removed.username,
-      });
-
-      if (this.players.length < MIN_PLAYERS_TO_START && this.state === 'countdown') {
-        this._cancelCountdown();
+          if (this.players.size < MIN_PLAYERS_TO_START && this.state === 'countdown') {
+            this._cancelCountdown();
+          }
+        }
+        break;
       }
     }
   }
 
-  getPlayerCount() { return this.players.length; }
-  isEmpty()        { return this.players.length === 0; }
+  getPlayerCount()    { return this.players.size; }
+  getTakenCardCount() { return Array.from(this.cards.values()).filter(c => c.owner !== null).length; }
+  isEmpty()           { return this.players.size === 0; }
 
   // ─── Bingo Claim ──────────────────────────────────────────────────────────
 
@@ -126,20 +153,25 @@ class BingoRoom {
       return { isWinner: false, message: 'Game is not active.' };
     }
 
-    const player = this.players.find((p) => p.telegramId === telegramId);
+    const player = this.players.get(telegramId);
     if (!player) {
       return { isWinner: false, message: 'Player not in this room.' };
     }
 
-    const { isWinner, pattern } = verifyBingoWin(player.card, this.calledNumbers);
+    // Check ALL cards owned by this player
+    for (const cardNumber of player.ownedCards) {
+      const cardInfo = this.cards.get(cardNumber);
+      if (!cardInfo) continue;
 
-    if (!isWinner) {
-      return { isWinner: false, message: 'Not a valid Bingo yet — keep playing!' };
+      const { isWinner, pattern } = verifyBingoWin(cardInfo.card, this.calledNumbers);
+      if (isWinner) {
+        console.log(`[BingoRoom ${this.roomId}] WINNER: ${player.username} card #${cardNumber} via ${pattern}`);
+        await this._endGame([telegramId]);
+        return { isWinner: true, pattern, cardNumber, message: 'Bingo confirmed! 🎉' };
+      }
     }
 
-    console.log(`[BingoRoom ${this.roomId}] WINNER: ${player.username} via ${pattern}`);
-    await this._endGame([telegramId]);
-    return { isWinner: true, pattern, message: 'Bingo confirmed! 🎉' };
+    return { isWinner: false, message: 'Not a valid Bingo yet — keep playing!' };
   }
 
   // ─── Private Lifecycle ────────────────────────────────────────────────────
@@ -152,10 +184,10 @@ class BingoRoom {
       roomId:     this.roomId,
       durationMs: COUNTDOWN_DURATION_MS,
       endsAt:     this._countdownEnd,
-      message:    `Game starts in ${COUNTDOWN_DURATION_MS / 1000}s! More players can still join…`,
+      message:    `Game starts in ${COUNTDOWN_DURATION_MS / 1000}s! More players can still buy cards…`,
     });
 
-    console.log(`[BingoRoom ${this.roomId}] Countdown started. ${this.players.length} players.`);
+    console.log(`[BingoRoom ${this.roomId}] Countdown started. ${this.players.size} players.`);
 
     this._countdownTimer = setTimeout(async () => {
       await this._startGame();
@@ -172,27 +204,20 @@ class BingoRoom {
       roomId:  this.roomId,
       message: 'A player left. Waiting for more players…',
     });
-    console.log(`[BingoRoom ${this.roomId}] Countdown cancelled.`);
   }
 
   async _startGame() {
-    if (this.players.length < MIN_PLAYERS_TO_START) {
+    if (this.players.size < MIN_PLAYERS_TO_START) {
       this._cancelCountdown();
       return;
     }
 
-    const stakeResult = await collectStakes(this.players, this.stake);
-    if (!stakeResult.success) {
-      this.io.to(this.roomId).emit('bingo:error', {
-        roomId:     this.roomId,
-        message:    'A player has insufficient balance. Game cancelled.',
-        telegramId: stakeResult.failed,
-      });
-      this.state = 'waiting';
-      return;
-    }
+    // Count total cards bought = total stakes collected
+    const takenCards  = this.getTakenCardCount();
+    const totalPool   = +(takenCards * this.stake).toFixed(2);
+    const brokerFee   = +(takenCards * 1).toFixed(2); // 1 Birr per card
+    const winnerPrize = +(totalPool - brokerFee).toFixed(2);
 
-    const { totalPool, brokerFee, winnerPrize } = calculatePrize(this.players.length, this.stake);
     this.totalPool   = totalPool;
     this.brokerFee   = brokerFee;
     this.winnerPrize = winnerPrize;
@@ -202,20 +227,25 @@ class BingoRoom {
 
     console.log(
       `[BingoRoom ${this.roomId}] Game started | ` +
-      `Players: ${this.players.length} | Prize: ${winnerPrize} Birr`
+      `Players: ${this.players.size} | Cards: ${takenCards} | Prize: ${winnerPrize} Birr`
     );
 
-    // ✅ Send each player their own card
-    for (const player of this.players) {
+    // ✅ Send each player their owned cards + prize info
+    for (const [telegramId, player] of this.players.entries()) {
+      const playerCards = player.ownedCards.map(cn => ({
+        cardNumber: cn,
+        card: this.cards.get(cn)?.card,
+      }));
+
       this.io.to(player.socketId).emit('bingo:gameStarted', {
-        roomId:       this.roomId,
-        card:         player.card,
-        pickedNumber: player.pickedNumber,
-        stake:        this.stake,
+        roomId:      this.roomId,
+        cards:       playerCards,   // array of cards player owns
+        stake:       this.stake,
         totalPool,
         brokerFee,
         winnerPrize,
-        playerCount:  this.players.length,
+        playerCount: this.players.size,
+        cardCount:   takenCards,
       });
     }
 
@@ -249,7 +279,14 @@ class BingoRoom {
       roomId:  this.roomId,
       message: 'All numbers drawn with no winner. Stakes refunded.',
     });
-    await refundStakes(this.players.map((p) => p.telegramId), this.stake);
+    const allOwners = [...new Set(
+      Array.from(this.cards.values())
+        .filter(c => c.owner)
+        .map(c => c.owner)
+    )];
+    // Refund each card individually
+    const takenCards = this.getTakenCardCount();
+    await refundStakes(allOwners, this.stake * (takenCards / allOwners.length));
     await this._saveHistory([]);
   }
 
@@ -260,11 +297,14 @@ class BingoRoom {
 
     await disburseWinnings(winnerTelegramIds, this.winnerPrize);
 
-    const winners = this.players.filter((p) => winnerTelegramIds.includes(p.telegramId));
+    const winners = winnerTelegramIds.map(id => {
+      const p = this.players.get(id);
+      return { telegramId: id, username: p?.username };
+    });
 
     this.io.to(this.roomId).emit('bingo:gameOver', {
       roomId:        this.roomId,
-      winners:       winners.map((w) => ({ telegramId: w.telegramId, username: w.username })),
+      winners,
       winnerPrize:   this.winnerPrize,
       calledNumbers: this.calledNumbers,
     });
@@ -274,19 +314,24 @@ class BingoRoom {
 
   async _saveHistory(winnerTelegramIds) {
     try {
+      const participants = [];
+      for (const [telegramId, player] of this.players.entries()) {
+        for (const cardNumber of player.ownedCards) {
+          participants.push({
+            telegramId,
+            username:     player.username,
+            stake:        this.stake,
+            cardNumber,
+            didWin:       winnerTelegramIds.includes(telegramId),
+            prizeReceived: winnerTelegramIds.includes(telegramId) ? this.winnerPrize : 0,
+          });
+        }
+      }
+
       await GameHistory.create({
-        roomId:       this.roomId,
-        gameType:     'bingo',
-        participants: this.players.map((p) => ({
-          telegramId:   p.telegramId,
-          username:     p.username,
-          stake:        this.stake,
-          pickedNumber: p.pickedNumber,
-          didWin:       winnerTelegramIds.includes(p.telegramId),
-          prizeReceived: winnerTelegramIds.includes(p.telegramId)
-            ? Math.floor((this.winnerPrize / winnerTelegramIds.length) * 100) / 100
-            : 0,
-        })),
+        roomId:        this.roomId,
+        gameType:      'bingo',
+        participants,
         totalPool:     this.totalPool,
         brokerFee:     this.brokerFee,
         winnerPrize:   this.winnerPrize,
