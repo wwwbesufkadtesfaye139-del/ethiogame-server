@@ -1,4 +1,4 @@
-const { calculatePrize, collectStakes, refundStakes, disburseWinnings } = require('../services/BrokerService');
+const { calculatePrize, refundStakes, disburseWinnings } = require('../services/BrokerService');
 const GameHistory = require('../models/GameHistory');
 
 const AUTO_CANCEL_MS = 120_000;  // 120 seconds to fill the room
@@ -241,17 +241,8 @@ class LudoRoom {
   }
 
   async _startGame() {
-    const stakeResult = await collectStakes(this.players, this.stake);
-    if (!stakeResult.success) {
-      this.io.to(this.roomId).emit('ludo:error', {
-        roomId: this.roomId,
-        message: 'A player has insufficient balance. Game cancelled.',
-        telegramId: stakeResult.failed,
-      });
-      this.state = 'cancelled';
-      return;
-    }
-
+    // Stakes were already collected atomically when each player joined/created the room
+    // (in ludoHandlers.js via User.deductBalance). Do NOT collect again here.
     const { totalPool, brokerFee, winnerPrize } = calculatePrize(this.players.length, this.stake);
     this.totalPool = totalPool;
     this.brokerFee = brokerFee;
