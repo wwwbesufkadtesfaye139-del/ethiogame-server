@@ -1,35 +1,39 @@
 require('dotenv').config();
-const http = require('http');
+const http    = require('http');
 const express = require('express');
-const cors = require('cors');
+const cors    = require('cors');
+const multer  = require('multer');
 const { Server } = require('socket.io');
 
-const connectDB = require('./config/db');
-const User = require('./models/User');
+const connectDB   = require('./config/db');
+const User        = require('./models/User');
 const Transaction = require('./models/Transaction');
 const BingoManager = require('./managers/BingoManager');
-const LudoManager = require('./managers/LudoManager');
+const LudoManager  = require('./managers/LudoManager');
 const registerBingoHandlers = require('./socket/bingoHandlers');
-const registerLudoHandlers = require('./socket/ludoHandlers');
-const registerUserHandlers = require('./socket/userHandlers');
+const registerLudoHandlers  = require('./socket/ludoHandlers');
+const registerUserHandlers  = require('./socket/userHandlers');
 
 const PORT = process.env.PORT || 3000;
 const STALE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
+// multer — store upload in memory as a Buffer (no disk needed)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 10 * 1024 * 1024 }, // 10 MB max
+});
 
 // ─── App & Server Setup ───────────────────────────────────────────────────────
 
 const app = express();
 
 app.use(cors({ origin: '*' }));
-app.use(express.json({ limit: '10mb' })); // ✅ increased limit for base64 images
+app.use(express.json({ limit: '10mb' }));
 
 const httpServer = http.createServer(app);
 
 const io = new Server(httpServer, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST'],
-  },
+  cors: { origin: '*', methods: ['GET', 'POST'] },
   pingTimeout: 30000,
   pingInterval: 10000,
 });
@@ -41,7 +45,7 @@ connectDB();
 // ─── Game Managers ────────────────────────────────────────────────────────────
 
 const bingoManager = new BingoManager(io);
-const ludoManager = new LudoManager(io);
+const ludoManager  = new LudoManager(io);
 global.bingoManager = bingoManager;
 global.ludoManager  = ludoManager;
 
@@ -56,8 +60,8 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'ok',
     bingoRooms: bingoManager.getRoomCount(),
-    ludoRooms: ludoManager.getRoomCount(),
-    timestamp: new Date().toISOString(),
+    ludoRooms:  ludoManager.getRoomCount(),
+    timestamp:  new Date().toISOString(),
   });
 });
 
@@ -66,10 +70,10 @@ app.get('/user/:telegramId', async (req, res) => {
     const user = await User.findOne({ telegramId: req.params.telegramId });
     if (!user) return res.status(404).json({ error: 'User not found.' });
     res.json({
-      telegramId: user.telegramId,
-      username: user.username,
-      balance: user.balance,
-      totalWinnings: user.totalWinnings,
+      telegramId:       user.telegramId,
+      username:         user.username,
+      balance:          user.balance,
+      totalWinnings:    user.totalWinnings,
       totalGamesPlayed: user.totalGamesPlayed,
     });
   } catch (err) {
@@ -99,16 +103,16 @@ app.get('/lobby/ludo', (_req, res) => {
 });
 
 // ─── POST /deposit/upload ─────────────────────────────────────────────────────
-// Called by the Mini App DepositScreen when user uploads a Telebirr receipt.
-// Receives base64 image + user info, forwards photo to the Telegram admin group,
-// and creates a pending Transaction record in MongoDB.
+// Accepts multipart/form-data with fields: photo (file), telegramId, username
+// Forwards photo to Telegram admin and creates a pending Transaction in MongoDB.
 
-app.post('/deposit/upload', async (req, res) => {
-  const { image, mimeType, telegramId, username } = req.body;
+app.post('/deposit/upload', upload.single('photo'), async (req, res) => {
+  const telegramId = req.body?.telegramId;
+  const username   = req.body?.username || 'Anonymous';
+  const file       = req.file;
 
-  // ── Validate input ──────────────────────────────────────────────────────────
-  if (!image || !telegramId) {
-    return res.status(400).json({ success: false, message: 'Missing image or telegramId.' });
+  if (!file || !telegramId) {
+    return res.status(400).json({ success: false, message: 'Missing photo or telegramId.' });
   }
 
   const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -123,11 +127,11 @@ app.post('/deposit/upload', async (req, res) => {
     // ── Find or create user ─────────────────────────────────────────────────
     const user = await User.findOneAndUpdate(
       { telegramId: String(telegramId) },
-      { $setOnInsert: { telegramId: String(telegramId), username: username || 'Anonymous', balance: 0 } },
+      { $setOnInsert: { telegramId: String(telegramId), username, balance: 0 } },
       { upsert: true, new: true }
     );
 
-    // ── Spam guard: max 3 pending deposits ──────────────────────────────────
+    // ── Spam guard ──────────────────────────────────────────────────────────
     const pendingCount = await Transaction.countPendingByUser(String(telegramId));
     if (pendingCount >= 3) {
       return res.status(429).json({
@@ -136,7 +140,7 @@ app.post('/deposit/upload', async (req, res) => {
       });
     }
 
-    // ── Create pending Transaction (amount=0 until admin sets it) ───────────
+    // ── Create pending Transaction ──────────────────────────────────────────
     const txn = await Transaction.create({
       userId:     user._id,
       telegramId: String(telegramId),
@@ -146,18 +150,14 @@ app.post('/deposit/upload', async (req, res) => {
       amount:     0,
     });
 
-    // ── Convert base64 → Buffer, forward photo to Telegram admin ────────────
-    const imageBuffer = Buffer.from(image, 'base64');
-    const mime        = mimeType || 'image/jpeg';
-    const ext         = mime.split('/')[1]?.split('+')[0] || 'jpg';
-
+    // ── Forward photo to Telegram admin ─────────────────────────────────────
     const formData = new FormData();
-    const blob     = new Blob([imageBuffer], { type: mime });
+    const blob     = new Blob([file.buffer], { type: file.mimetype });
     formData.append('chat_id',    ADMIN_ID);
-    formData.append('photo',      blob, `receipt_${txn._id}.${ext}`);
+    formData.append('photo',      blob, file.originalname || `receipt_${txn._id}.jpg`);
     formData.append('caption',
       `📥 *New Deposit Request (Mini App)*\n\n` +
-      `👤 @${username || 'Anonymous'} (\`${telegramId}\`)\n` +
+      `👤 @${username} (\`${telegramId}\`)\n` +
       `🆔 Transaction ID: \`${txn._id}\`\n\n` +
       `To approve:\n\`/release ${telegramId} <amount>\`\n\n` +
       `To reject:\n\`/reject ${txn._id} <reason>\``
@@ -171,14 +171,11 @@ app.post('/deposit/upload', async (req, res) => {
     const tgData = await tgRes.json();
 
     if (tgData.ok) {
-      // Save the Telegram file_id so admin can reference the photo later
       const fileId = tgData.result?.photo?.at(-1)?.file_id;
       if (fileId) {
         await Transaction.findByIdAndUpdate(txn._id, { screenshotFileId: fileId });
       }
     } else {
-      // Log the error but still return success — transaction is saved,
-      // admin can still find it via /pending command in the bot
       console.warn('[deposit/upload] Telegram forward failed:', tgData.description);
     }
 
@@ -198,11 +195,8 @@ app.post('/deposit/upload', async (req, res) => {
 
 io.on('connection', (socket) => {
   console.log(`[Socket] Connected: ${socket.id}`);
-
-  // ✅ FIXED — pass io as second argument so handlers can emit balance updates
-  // to specific sockets (e.g. notifying winner after game ends)
-  registerBingoHandlers(socket, io, bingoManager); // ← was: registerBingoHandlers(socket, bingoManager)
-  registerLudoHandlers(socket, io, ludoManager);   // ← was: registerLudoHandlers(socket, ludoManager)
+  registerBingoHandlers(socket, io, bingoManager);
+  registerLudoHandlers(socket, io, ludoManager);
   registerUserHandlers(socket, io);
 
   socket.on('disconnect', (reason) => {
