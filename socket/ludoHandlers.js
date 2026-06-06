@@ -167,25 +167,24 @@ const registerLudoHandlers = (socket, io, ludoManager) => {
     const result = await room.movePiece(telegramId, Number(pieceIndex), Number(diceValue));
     safAck(ack, { roomId, ...result });
 
-    // ✅ If game ended — credit winner using your creditBalance static
+    // Prize was already disbursed inside LudoRoom._endGame() via disburseWinnings().
+    // Do NOT call creditBalance again here — that would pay the winner twice.
+    // Just read the updated balance and push it to the winner's socket for the UI.
     if (room.state === 'finished' && result.winner) {
       try {
         const winnerTelegramId = result.winner.telegramId || result.winner;
-        const prize = result.winnerPrize || 0;
+        const winnerSocketId   = result.winner.socketId;
 
-        if (prize > 0) {
-          // ✅ Credit winner atomically, marks as winning for totalWinnings stat
-          const updatedWinner = await User.creditBalance(winnerTelegramId, prize, true);
-          if (updatedWinner) {
-            // ✅ Find winner's socket and send them the new balance
-            const winnerSocketId = result.winner.socketId;
-            if (winnerSocketId) {
-              io.to(winnerSocketId).emit('user:balanceUpdated', { balance: updatedWinner.balance });
-            }
+        if (winnerSocketId) {
+          const winner = await User.findOne({ telegramId: winnerTelegramId });
+          if (winner) {
+            io.to(winnerSocketId).emit('user:balanceUpdated', {
+              balance: winner.balance - (winner.lockedBalance || 0),
+            });
           }
         }
       } catch (err) {
-        console.error('[Ludo] credit winner error:', err);
+        console.error('[Ludo] balance push error:', err);
       }
 
       setTimeout(() => ludoManager.removeRoom(roomId), 5000);
