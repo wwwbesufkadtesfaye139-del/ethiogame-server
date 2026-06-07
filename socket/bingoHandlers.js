@@ -22,6 +22,17 @@ const User = require('../models/User');
 const registerBingoHandlers = (socket, io, bingoManager) => {
   const { id: socketId } = socket;
 
+  // ── Bug 1 Fix: track which room this socket is in so we leave before joining a new one ──
+  let currentRoomId = null;
+  const joinRoom = (newRoomId) => {
+    if (currentRoomId && currentRoomId !== newRoomId) {
+      socket.leave(currentRoomId);
+    }
+    currentRoomId = newRoomId;
+    socket.join(newRoomId);
+  };
+  socket.on('disconnect', () => { currentRoomId = null; });
+
   // ── bingo:getCards ─────────────────────────────────────────────────────────
   // Get all 200 cards for a stake room (for the lobby)
   socket.on('bingo:getCards', ({ stake } = {}, ack) => {
@@ -30,7 +41,7 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
     const { room } = bingoManager.findOrCreateRoom(Number(stake));
     if (!room) return safAck(ack, { success: false, message: 'Could not get room.' });
 
-    socket.join(room.roomId);
+    joinRoom(room.roomId); // Bug 1 Fix: leaves old room first
 
     safAck(ack, {
       success:     true,
@@ -77,7 +88,7 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
         return safAck(ack, { success: false, message: 'Room not available.' });
       }
 
-      socket.join(room.roomId);
+      joinRoom(room.roomId); // Bug 1 Fix: leaves old room first
 
       // ✅ Buy the card
       const result = room.buyCard(telegramId, username, socketId, Number(cardNumber));
@@ -117,16 +128,19 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
 
     const claimResult = await room.claimBingo(telegramId);
 
-    // Credit winner balance
-    if (claimResult.isWinner && claimResult.winnerPrize) {
+    // Bug 2 Fix: _endGame → disburseWinnings already credited the DB.
+    // Do NOT call creditBalance again (would double-pay the winner).
+    // Just fetch the real updated balance and push it to the winner's screen.
+    if (claimResult.isWinner) {
       try {
-        const updatedWinner = await User.creditBalance(telegramId, claimResult.winnerPrize, true);
+        const updatedWinner = await User.findOne({ telegramId });
         if (updatedWinner) {
-          socket.emit('user:balanceUpdated', { balance: updatedWinner.balance - (updatedWinner.lockedBalance || 0) });
-          claimResult.newBalance = updatedWinner.balance;
+          const available = updatedWinner.balance - (updatedWinner.lockedBalance || 0);
+          socket.emit('user:balanceUpdated', { balance: available });
+          claimResult.newBalance = available;
         }
       } catch (err) {
-        console.error('[BingoHandlers] credit winnings error:', err.message);
+        console.error('[BingoHandlers] fetch updated balance error:', err.message);
       }
     }
 
