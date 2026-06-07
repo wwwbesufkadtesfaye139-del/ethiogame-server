@@ -166,8 +166,12 @@ class BingoRoom {
       const { isWinner, pattern } = verifyBingoWin(cardInfo.card, this.calledNumbers);
       if (isWinner) {
         console.log(`[BingoRoom ${this.roomId}] WINNER: ${player.username} card #${cardNumber} via ${pattern}`);
+        // _endGame → disburseWinnings() credits the DB. We capture winnerPrize
+        // BEFORE calling _endGame so it's available in the return value.
+        const prize = this.winnerPrize;
         await this._endGame([telegramId]);
-        return { isWinner: true, pattern, cardNumber, message: 'Bingo confirmed! 🎉' };
+        // BUG 2 FIX: include winnerPrize so bingoHandlers can push balance update
+        return { isWinner: true, pattern, cardNumber, winnerPrize: prize, message: 'Bingo confirmed! 🎉' };
       }
     }
 
