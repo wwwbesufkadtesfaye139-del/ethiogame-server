@@ -156,6 +156,11 @@ const handleReject = async (ctx) => {
   txn.approvedAt      = new Date();
   await txn.save();
 
+  // FIX: if this was a withdrawal, release the locked funds back to available
+  if (txn.type === 'withdrawal' && txn.amount > 0) {
+    await User.rejectWithdrawal(txn.telegramId, txn.amount);
+  }
+
   // Notify player
   try {
     await ctx.api.sendMessage(
