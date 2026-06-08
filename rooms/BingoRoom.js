@@ -143,6 +143,16 @@ class BingoRoom {
   }
 
   getPlayerCount()    { return this.players.size; }
+
+  // Returns the cards owned by a specific player — used when they rejoin after disconnect
+  getPlayerCards(telegramId) {
+    const player = this.players.get(telegramId);
+    if (!player) return [];
+    return player.ownedCards.map(cn => ({
+      cardNumber: cn,
+      card: this.cards.get(cn)?.card || null,
+    }));
+  }
   getTakenCardCount() { return Array.from(this.cards.values()).filter(c => c.owner !== null).length; }
   isEmpty()           { return this.players.size === 0; }
 
