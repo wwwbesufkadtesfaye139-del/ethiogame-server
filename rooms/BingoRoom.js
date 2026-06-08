@@ -229,7 +229,7 @@ class BingoRoom {
     // Count total cards bought = total stakes collected
     const takenCards  = this.getTakenCardCount();
     const totalPool   = +(takenCards * this.stake).toFixed(2);
-    const brokerFee   = +(takenCards * 1).toFixed(2); // 1 Birr per card
+    const brokerFee   = +(totalPool * 0.10).toFixed(2); // 10% house fee
     const winnerPrize = +(totalPool - brokerFee).toFixed(2);
 
     this.totalPool   = totalPool;
