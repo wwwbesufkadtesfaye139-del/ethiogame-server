@@ -4,11 +4,17 @@ const Transaction = require('../models/Transaction');
 const registerUserHandlers = (socket, io) => {
 
   // ── user:getBalance ────────────────────────────────────────────────────────
+  // FIX: also join personal room so admin panel can push real-time updates
   socket.on('user:getBalance', async ({ telegramId } = {}, cb) => {
     if (!telegramId) return cb?.({ success: false });
     try {
       const user = await User.findOne({ telegramId: String(telegramId) });
       if (!user) return cb?.({ success: false, message: 'User not found' });
+
+      // Join a personal room named after the user's Telegram ID.
+      // Admin REST routes can now emit to "user:<id>" to push live balance updates.
+      socket.join(`user:${telegramId}`);
+
       cb?.({ success: true, balance: user.balance - (user.lockedBalance || 0) });
     } catch (err) {
       console.error('[userHandlers] getBalance error:', err.message);
@@ -33,15 +39,12 @@ const registerUserHandlers = (socket, io) => {
   // ── server:getStats ────────────────────────────────────────────────────────
   socket.on('server:getStats', async (_data, cb) => {
     try {
-      // Get live room counts from global managers
       const bingoRooms = global.bingoManager ? global.bingoManager.getRoomCount() : 0;
       const ludoRooms  = global.ludoManager  ? global.ludoManager.getRoomCount()  : 0;
       const liveRooms  = bingoRooms + ludoRooms;
 
-      // Get online count
       const onlineCount = io.engine.clientsCount || 0;
 
-      // Get total paid today
       const today = new Date();
       today.setHours(0, 0, 0, 0);
       const paidResult = await Transaction.aggregate([
@@ -91,7 +94,7 @@ const registerUserHandlers = (socket, io) => {
         telebirrReference: phone,
       });
 
-      // ✅ Notify admin using Node 18 built-in fetch
+      // Notify admin
       const adminId = process.env.ADMIN_TELEGRAM_ID || process.env.ADMIN_GROUP_ID || process.env.ADMIN_ID;
       if (adminId && process.env.BOT_TOKEN) {
         try {
