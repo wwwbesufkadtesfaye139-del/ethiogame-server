@@ -13,7 +13,8 @@ const LudoManager  = require('./managers/LudoManager');
 const registerBingoHandlers = require('./socket/bingoHandlers');
 const registerLudoHandlers  = require('./socket/ludoHandlers');
 const registerUserHandlers  = require('./socket/userHandlers');
-const adminRoutes = require('./adminRoutes');
+// FIX: adminRoutes is now a factory function that needs io passed to it
+const makeAdminRouter = require('./adminRoutes');
 
 const PORT = process.env.PORT || 3000;
 const STALE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
@@ -30,7 +31,6 @@ const app = express();
 
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
-app.use('/admin/api', adminRoutes);
 
 const httpServer = http.createServer(app);
 
@@ -39,6 +39,10 @@ const io = new Server(httpServer, {
   pingTimeout: 30000,
   pingInterval: 10000,
 });
+
+// FIX: Mount admin routes AFTER io is created, passing io so it can
+//      emit real-time balance updates to users' open Mini App sessions.
+app.use('/admin/api', makeAdminRouter(io));
 
 // ─── Connect DB ───────────────────────────────────────────────────────────────
 
@@ -105,8 +109,6 @@ app.get('/lobby/ludo', (_req, res) => {
 });
 
 // ─── POST /deposit/upload ─────────────────────────────────────────────────────
-// Accepts multipart/form-data with fields: photo (file), telegramId, username
-// Forwards photo to Telegram admin and creates a pending Transaction in MongoDB.
 
 app.post('/deposit/upload', upload.single('photo'), async (req, res) => {
   const telegramId = req.body?.telegramId;
