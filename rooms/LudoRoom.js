@@ -182,7 +182,13 @@ class LudoRoom {
     const kingsCount = currentPlayer.pieces.filter((p) => p === FINISHED_POSITION).length;
     if (kingsCount >= this.winCondition) {
       await this._endGame(telegramId);
-      return { success: true, newPosition, message: 'Move made. You win!' };
+      // Bug 9 Fix: return winner so ludoHandlers can fetch updated balance and push it
+      return {
+        success: true,
+        newPosition,
+        message: 'Move made. You win!',
+        winner: { telegramId: currentPlayer.telegramId, socketId: currentPlayer.socketId },
+      };
     }
 
     // Only advance turn if dice was not a 6 (reward: roll again on 6)
@@ -214,6 +220,18 @@ class LudoRoom {
       if (this.state === 'waiting') {
         this.state = 'cancelled';
         console.log(`[LudoRoom ${this.roomId}] Auto-cancelled after ${AUTO_CANCEL_MS / 1000}s.`);
+
+        // Bug 6 Fix: Refund every player who already paid their stake.
+        // Before this fix, stakes were silently lost on auto-cancel.
+        const User = require('../models/User');
+        for (const player of this.players) {
+          try {
+            await User.creditBalance(player.telegramId, this.stake);
+            console.log(`[LudoRoom ${this.roomId}] Refunded ${this.stake} Birr to ${player.username}`);
+          } catch (err) {
+            console.error(`[LudoRoom ${this.roomId}] Refund failed for ${player.telegramId}:`, err.message);
+          }
+        }
 
         // Notify the creator specifically
         const creator = this.players[0];
