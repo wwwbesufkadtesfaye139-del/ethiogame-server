@@ -215,6 +215,52 @@ module.exports = function makeAdminRouter(io) {
     }
   });
 
+  // ─── PATCH /admin/api/users/:telegramId/clearlock ────────────────────────
+  // Resets a stuck lockedBalance to 0 when no pending withdrawal exists.
+
+  router.patch('/users/:telegramId/clearlock', async (req, res) => {
+    try {
+      const user = await User.findOne({ telegramId: req.params.telegramId });
+      if (!user) return res.status(404).json({ error: 'User not found.' });
+
+      const stuckAmount = user.lockedBalance || 0;
+      if (stuckAmount === 0) {
+        return res.json({ success: true, message: 'No locked balance to clear.', freed: 0 });
+      }
+
+      const updated = await User.findOneAndUpdate(
+        { telegramId: req.params.telegramId },
+        { $set: { lockedBalance: 0 } },
+        { new: true }
+      );
+
+      // Create audit record
+      await Transaction.create({
+        userId:     user._id,
+        telegramId: user.telegramId,
+        username:   user.username,
+        amount:     stuckAmount,
+        type:       'deposit',
+        status:     'approved',
+        approvedBy: 'ADMIN_PANEL',
+        approvedAt: new Date(),
+        reviewNote: `Admin cleared stuck locked balance of ${stuckAmount} Birr`,
+      });
+
+      // Push real-time balance update
+      await pushBalance(req.params.telegramId);
+
+      res.json({
+        success:     true,
+        freed:       stuckAmount,
+        newBalance:  updated.balance,
+        newLocked:   updated.lockedBalance,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // ─── PATCH /admin/api/users/:telegramId/block ─────────────────────────────
 
   router.patch('/users/:telegramId/block', async (req, res) => {
