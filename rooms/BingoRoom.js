@@ -283,14 +283,20 @@ class BingoRoom {
       roomId:  this.roomId,
       message: 'All numbers drawn with no winner. Stakes refunded.',
     });
-    const allOwners = [...new Set(
-      Array.from(this.cards.values())
-        .filter(c => c.owner)
-        .map(c => c.owner)
-    )];
-    // Refund each card individually
-    const takenCards = this.getTakenCardCount();
-    await refundStakes(allOwners, this.stake * (takenCards / allOwners.length));
+
+    // Bug 7 Fix: Count exactly how many cards each player bought and refund
+    // only that amount. Old code divided total cards equally across all owners
+    // which robbed players who bought more cards and overpaid those who bought fewer.
+    const cardsByOwner = new Map();
+    for (const card of this.cards.values()) {
+      if (card.owner) {
+        cardsByOwner.set(card.owner, (cardsByOwner.get(card.owner) || 0) + 1);
+      }
+    }
+    for (const [telegramId, cardCount] of cardsByOwner.entries()) {
+      await refundStakes([telegramId], this.stake * cardCount);
+    }
+
     await this._saveHistory([]);
   }
 
