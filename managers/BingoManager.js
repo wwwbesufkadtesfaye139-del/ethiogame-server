@@ -19,6 +19,11 @@ class BingoManager {
     return this.rooms.get(roomId) || null;
   }
 
+  // Returns all active rooms — used to find a reconnecting player's room
+  getAllRooms() {
+    return Array.from(this.rooms.values());
+  }
+
   getRoomCount() {
     return this.rooms.size;
   }
