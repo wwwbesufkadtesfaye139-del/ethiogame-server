@@ -13,6 +13,7 @@ const LudoManager  = require('./managers/LudoManager');
 const registerBingoHandlers = require('./socket/bingoHandlers');
 const registerLudoHandlers  = require('./socket/ludoHandlers');
 const registerUserHandlers  = require('./socket/userHandlers');
+const adminRoutes = require('./adminRoutes');
 
 const PORT = process.env.PORT || 3000;
 const STALE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
@@ -29,6 +30,7 @@ const app = express();
 
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
+app.use('/admin/api', adminRoutes);
 
 const httpServer = http.createServer(app);
 
