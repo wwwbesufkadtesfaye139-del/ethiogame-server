@@ -159,6 +159,35 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
       setTimeout(() => bingoManager.removeRoom(roomId), 3000);
     }
   });
+
+  // ── bingo:rejoin ───────────────────────────────────────────────────────────
+  // Called on reconnect. Finds the user's active room and sends full game state
+  // back so they can resume without losing progress.
+  socket.on('bingo:rejoin', ({ telegramId } = {}, ack) => {
+    if (!telegramId) return safAck(ack, { success: true, inGame: false });
+
+    const allRooms = bingoManager.getAllRooms();
+    for (const room of allRooms) {
+      if (room.state === 'active' && room.players.has(telegramId)) {
+        joinRoom(room.roomId);
+        const ownedCards = room.getPlayerCards(telegramId);
+        console.log(`[BingoHandlers] ${telegramId} rejoined room ${room.roomId}`);
+        return safAck(ack, {
+          success:       true,
+          inGame:        true,
+          roomId:        room.roomId,
+          stake:         room.stake,
+          calledNumbers: room.calledNumbers,
+          ownedCards,
+          state:         'active',
+          playerCount:   room.getPlayerCount(),
+          winnerPrize:   room.winnerPrize,
+        });
+      }
+    }
+    safAck(ack, { success: true, inGame: false });
+  });
+
 };
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
