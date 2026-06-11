@@ -125,7 +125,13 @@ module.exports = function makeAdminRouter(io) {
     try {
       const page    = Math.max(1, parseInt(req.query.page)  || 1);
       const limit   = Math.min(50, parseInt(req.query.limit) || 20);
-      const search  = req.query.search || '';
+      const rawSearch = req.query.search || '';
+      // FIX: escape all regex special characters before passing to MongoDB $regex.
+      // Without this, a crafted string like (a+)+ causes catastrophic backtracking
+      // that hangs the MongoDB query and freezes the server (ReDoS attack).
+      const search = rawSearch
+        .replace(/[.*+?^${}()|[\]\\]/g, '\\$&') // escape special chars
+        .slice(0, 100);                           // cap length for extra safety
       const filter  = req.query.filter || 'all';
       const sortBy  = req.query.sort   || 'createdAt';
       const sortDir = req.query.dir    === 'asc' ? 1 : -1;
