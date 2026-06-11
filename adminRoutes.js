@@ -3,36 +3,59 @@
  * ──────────────
  * Secure REST API routes for the EthioGame Admin Panel.
  *
- * HOW TO USE:
- *   1. Add ADMIN_SECRET=your-secret-key-here to your Railway env vars
- *   2. This file is already imported and mounted in index.js — no changes needed there.
+ * SECURITY: Admin identity is proven using Telegram's HMAC-SHA256 initData —
+ * no shared secret is stored in the client bundle.
  *
- * All routes are protected by the ADMIN_SECRET key.
- * Pass it as: Authorization: Bearer <ADMIN_SECRET>
+ * HOW IT WORKS:
+ *   Client sends:  Authorization: TelegramInitData <initData>
+ *   Server:        1. Verifies the initData signature with BOT_TOKEN
+ *                  2. Checks the verified telegramId matches ADMIN_TELEGRAM_ID env var
  *
- * FIXED BUGS:
- *   1. Withdrawal approval now correctly DEDUCTS balance instead of crediting it.
- *   2. Withdrawal rejection now unlocks the locked balance.
- *   3. All balance-changing actions now emit real-time socket updates to the user.
+ * REQUIRED RAILWAY ENV VARS:
+ *   BOT_TOKEN           — your Telegram bot token
+ *   ADMIN_TELEGRAM_ID   — your Telegram user ID (e.g. 6584576909)
  */
 
 const express     = require('express');
 const User        = require('./models/User');
 const Transaction = require('./models/Transaction');
 const GameSession = require('./models/GameSession');
+const verifyTelegramInitData = require('./utils/verifyTelegram');
 
 // ─── Factory: accepts io so we can push real-time balance updates ──────────────
 module.exports = function makeAdminRouter(io) {
   const router = express.Router();
 
   // ─── Auth Middleware ─────────────────────────────────────────────────────────
+  // SECURITY FIX: verify Telegram identity instead of checking a hardcoded secret.
+  // The client sends its Telegram initData; we verify it cryptographically and
+  // confirm the user is the designated admin. Nothing secret lives in the client.
 
   const requireAdminKey = (req, res, next) => {
-    const auth = req.headers['authorization'] || '';
-    const key  = auth.replace('Bearer ', '').trim();
-    if (!key || key !== process.env.ADMIN_SECRET) {
-      return res.status(401).json({ error: 'Unauthorized. Invalid or missing ADMIN_SECRET.' });
+    const auth     = req.headers['authorization'] || '';
+    const initData = auth.replace('TelegramInitData ', '').trim();
+
+    if (!initData) {
+      return res.status(401).json({ error: 'Unauthorized. No credentials provided.' });
     }
+
+    const BOT_TOKEN        = process.env.BOT_TOKEN;
+    const ADMIN_TELEGRAM_ID = process.env.ADMIN_TELEGRAM_ID;
+
+    if (!BOT_TOKEN || !ADMIN_TELEGRAM_ID) {
+      console.error('[Admin] BOT_TOKEN or ADMIN_TELEGRAM_ID env var not set.');
+      return res.status(500).json({ error: 'Server configuration error.' });
+    }
+
+    const user = verifyTelegramInitData(initData, BOT_TOKEN);
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized. Invalid or expired Telegram session.' });
+    }
+
+    if (String(user.id) !== String(ADMIN_TELEGRAM_ID)) {
+      return res.status(403).json({ error: 'Forbidden. You are not an admin.' });
+    }
+
     next();
   };
 
