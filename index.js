@@ -13,8 +13,8 @@ const LudoManager  = require('./managers/LudoManager');
 const registerBingoHandlers = require('./socket/bingoHandlers');
 const registerLudoHandlers  = require('./socket/ludoHandlers');
 const registerUserHandlers  = require('./socket/userHandlers');
-// FIX: adminRoutes is now a factory function that needs io passed to it
 const makeAdminRouter = require('./adminRoutes');
+const rateLimit = require('express-rate-limit');
 
 const PORT = process.env.PORT || 3000;
 const STALE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
@@ -29,8 +29,42 @@ const upload = multer({
 
 const app = express();
 
+// Trust Railway's proxy so rate limiter sees real client IPs
+app.set('trust proxy', 1);
+
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
+
+// ─── Rate Limiters ────────────────────────────────────────────────────────────
+
+// General: 100 requests per minute per IP
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please slow down.' },
+});
+
+// Deposit upload: max 5 per hour per IP (prevents receipt spam to admin)
+const depositLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many deposit attempts. Please wait before trying again.' },
+});
+
+// Admin API: 60 per minute per IP
+const adminLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many admin requests. Slow down.' },
+});
+
+app.use(generalLimiter);
 
 const httpServer = http.createServer(app);
 
@@ -42,7 +76,7 @@ const io = new Server(httpServer, {
 
 // FIX: Mount admin routes AFTER io is created, passing io so it can
 //      emit real-time balance updates to users' open Mini App sessions.
-app.use('/admin/api', makeAdminRouter(io));
+app.use('/admin/api', adminLimiter, makeAdminRouter(io));
 
 // ─── Socket Auth Middleware ───────────────────────────────────────────────────
 // Verifies every socket connection using Telegram's HMAC-SHA256 initData.
@@ -145,7 +179,7 @@ app.get('/lobby/ludo', (_req, res) => {
 
 // ─── POST /deposit/upload ─────────────────────────────────────────────────────
 
-app.post('/deposit/upload', upload.single('photo'), async (req, res) => {
+app.post('/deposit/upload', depositLimiter, upload.single('photo'), async (req, res) => {
   const telegramId = req.body?.telegramId;
   const username   = req.body?.username || 'Anonymous';
   const file       = req.file;
