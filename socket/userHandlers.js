@@ -69,8 +69,11 @@ const registerUserHandlers = (socket, io) => {
   // ── user:requestWithdraw ───────────────────────────────────────────────────
   socket.on('user:requestWithdraw', async ({ amount, phone } = {}, cb) => {
     const telegramId = socket.data.telegramId;
-    if (!telegramId || !amount || !phone) {
-      return cb?.({ success: false, message: 'Missing required fields' });
+
+    // FIX: validate amount is a real positive number — !amount passes for negatives
+    const parsedAmount = parseFloat(amount);
+    if (!telegramId || !phone || isNaN(parsedAmount) || parsedAmount <= 0) {
+      return cb?.({ success: false, message: 'Missing or invalid fields.' });
     }
 
     // Rate limit: max 5 withdrawal requests per hour
@@ -91,7 +94,7 @@ const registerUserHandlers = (socket, io) => {
         });
       }
 
-      const updatedUser = await User.lockForWithdrawal(String(telegramId), amount);
+      const updatedUser = await User.lockForWithdrawal(String(telegramId), parsedAmount);
       if (!updatedUser) {
         return cb?.({ success: false, message: 'Insufficient balance or account blocked.' });
       }
@@ -102,7 +105,7 @@ const registerUserHandlers = (socket, io) => {
         username:          updatedUser.username,
         type:              'withdrawal',
         status:            'pending',
-        amount,
+        amount:            parsedAmount,
         telebirrReference: phone,
       });
 
