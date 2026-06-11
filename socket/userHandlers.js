@@ -4,15 +4,15 @@ const Transaction = require('../models/Transaction');
 const registerUserHandlers = (socket, io) => {
 
   // ── user:getBalance ────────────────────────────────────────────────────────
-  // FIX: also join personal room so admin panel can push real-time updates
-  socket.on('user:getBalance', async ({ telegramId } = {}, cb) => {
+  socket.on('user:getBalance', async (_data, cb) => {
+    // SECURITY FIX: use server-verified telegramId — ignore client value
+    const telegramId = socket.data.telegramId;
     if (!telegramId) return cb?.({ success: false });
     try {
       const user = await User.findOne({ telegramId: String(telegramId) });
       if (!user) return cb?.({ success: false, message: 'User not found' });
 
-      // Join a personal room named after the user's Telegram ID.
-      // Admin REST routes can now emit to "user:<id>" to push live balance updates.
+      // Join personal room so admin panel can push real-time updates
       socket.join(`user:${telegramId}`);
 
       cb?.({ success: true, balance: user.balance - (user.lockedBalance || 0) });
@@ -23,7 +23,9 @@ const registerUserHandlers = (socket, io) => {
   });
 
   // ── user:getTransactions ───────────────────────────────────────────────────
-  socket.on('user:getTransactions', async ({ telegramId } = {}, cb) => {
+  socket.on('user:getTransactions', async (_data, cb) => {
+    // SECURITY FIX: use server-verified telegramId — ignore client value
+    const telegramId = socket.data.telegramId;
     if (!telegramId) return cb?.({ success: false });
     try {
       const transactions = await Transaction.find({ telegramId: String(telegramId) })
@@ -61,7 +63,9 @@ const registerUserHandlers = (socket, io) => {
   });
 
   // ── user:requestWithdraw ───────────────────────────────────────────────────
-  socket.on('user:requestWithdraw', async ({ telegramId, amount, phone } = {}, cb) => {
+  socket.on('user:requestWithdraw', async ({ amount, phone } = {}, cb) => {
+    // SECURITY FIX: use server-verified telegramId — ignore any client-sent telegramId
+    const telegramId = socket.data.telegramId;
     if (!telegramId || !amount || !phone) {
       return cb?.({ success: false, message: 'Missing required fields' });
     }
