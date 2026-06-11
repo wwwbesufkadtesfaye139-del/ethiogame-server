@@ -6,6 +6,11 @@
  */
 
 const User = require('../models/User');
+const { createSocketLimiter } = require('../utils/socketRateLimiter');
+
+// 60 rolls/moves per minute per user (generous for active gameplay)
+const rollLimiter = createSocketLimiter('ludoRoll', 60, 60 * 1000);
+const moveLimiter = createSocketLimiter('ludoMove', 60, 60 * 1000);
 
 const registerLudoHandlers = (socket, io, ludoManager) => {
   const { id: socketId } = socket;
@@ -144,7 +149,10 @@ const registerLudoHandlers = (socket, io, ludoManager) => {
     if (!telegramId || !roomId) {
       return safAck(ack, { success: false, message: 'Missing payload.' });
     }
-    const room = ludoManager.getRoom(roomId);
+
+    if (!rollLimiter(telegramId)) {
+      return safAck(ack, { success: false, message: 'Too many requests. Please slow down.' });
+    }
     if (!room) return safAck(ack, { success: false, message: 'Room not found.' });
 
     const result = room.rollDice(telegramId);
@@ -161,7 +169,9 @@ const registerLudoHandlers = (socket, io, ludoManager) => {
       return safAck(ack, { success: false, message: 'Missing move payload.' });
     }
 
-    const room = ludoManager.getRoom(roomId);
+    if (!moveLimiter(telegramId)) {
+      return safAck(ack, { success: false, message: 'Too many requests. Please slow down.' });
+    }
     if (!room) return safAck(ack, { success: false, message: 'Room not found.' });
 
     const result = await room.movePiece(telegramId, Number(pieceIndex));
