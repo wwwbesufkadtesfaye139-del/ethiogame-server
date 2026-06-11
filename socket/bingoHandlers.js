@@ -3,8 +3,8 @@
  * ────────────────────────────────────
  * Events — Client → Server:
  *   bingo:getCards    { stake }                          → get all 200 cards for a room
- *   bingo:buyCard     { telegramId, username, stake, cardNumber }  → buy one card
- *   bingo:claimBingo  { telegramId, roomId }             → claim bingo
+ *   bingo:buyCard     { stake, cardNumber }              → buy one card
+ *   bingo:claimBingo  { roomId }                        → claim bingo
  *
  * Events — Server → Client:
  *   bingo:cardsInfo     { cards[] }
@@ -15,6 +15,9 @@
  *   bingo:numberDrawn   { drawnNumber, calledNumbers }
  *   bingo:claimResult   { isWinner, pattern, cardNumber }
  *   bingo:gameOver      { winners, winnerPrize, calledNumbers }
+ *
+ * SECURITY: telegramId and username come from socket.data (verified by
+ *           Telegram initData on connect) — never from event payload.
  */
 
 const User = require('../models/User');
@@ -22,7 +25,7 @@ const User = require('../models/User');
 const registerBingoHandlers = (socket, io, bingoManager) => {
   const { id: socketId } = socket;
 
-  // ── Bug 1 Fix: track which room this socket is in so we leave before joining a new one ──
+  // Track which room this socket is in so we leave before joining a new one
   let currentRoomId = null;
   const joinRoom = (newRoomId) => {
     if (currentRoomId && currentRoomId !== newRoomId) {
@@ -34,14 +37,13 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
   socket.on('disconnect', () => { currentRoomId = null; });
 
   // ── bingo:getCards ─────────────────────────────────────────────────────────
-  // Get all 200 cards for a stake room (for the lobby)
   socket.on('bingo:getCards', ({ stake } = {}, ack) => {
     if (!stake) return safAck(ack, { success: false, message: 'Missing stake.' });
 
     const { room } = bingoManager.findOrCreateRoom(Number(stake));
     if (!room) return safAck(ack, { success: false, message: 'Could not get room.' });
 
-    joinRoom(room.roomId); // Bug 1 Fix: leaves old room first
+    joinRoom(room.roomId);
 
     safAck(ack, {
       success:     true,
@@ -53,14 +55,16 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
   });
 
   // ── bingo:buyCard ──────────────────────────────────────────────────────────
-  // Player buys a specific card number
-  socket.on('bingo:buyCard', async ({ telegramId, username, stake, cardNumber } = {}, ack) => {
-    if (!telegramId || !username || !stake || !cardNumber) {
+  socket.on('bingo:buyCard', async ({ stake, cardNumber } = {}, ack) => {
+    // SECURITY FIX: identity from verified socket.data — not from event payload
+    const telegramId = socket.data.telegramId;
+    const username   = socket.data.username;
+
+    if (!telegramId || !stake || !cardNumber) {
       return safAck(ack, { success: false, message: 'Missing required fields.' });
     }
 
     try {
-      // ✅ Check affordability
       const affordCheck = await User.canAffordStake(telegramId, Number(stake));
       if (!affordCheck.canJoin) {
         const messages = {
@@ -71,29 +75,23 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
         return safAck(ack, { success: false, message: messages[affordCheck.reason] || 'Cannot buy.' });
       }
 
-      // ✅ Deduct stake
       const updatedUser = await User.deductBalance(telegramId, Number(stake));
       if (!updatedUser) {
         return safAck(ack, { success: false, message: 'Balance deduction failed. Please try again.' });
       }
 
-      // ✅ Update app balance
       socket.emit('user:balanceUpdated', { balance: updatedUser.balance - (updatedUser.lockedBalance || 0) });
 
-      // Get or create room
       const { room } = bingoManager.findOrCreateRoom(Number(stake));
       if (!room) {
-        // Refund
         await User.creditBalance(telegramId, Number(stake));
         return safAck(ack, { success: false, message: 'Room not available.' });
       }
 
-      joinRoom(room.roomId); // Bug 1 Fix: leaves old room first
+      joinRoom(room.roomId);
 
-      // ✅ Buy the card
       const result = room.buyCard(telegramId, username, socketId, Number(cardNumber));
       if (!result.success) {
-        // Refund if card already taken or error
         await User.creditBalance(telegramId, Number(stake));
         socket.emit('user:balanceUpdated', { balance: updatedUser.balance });
         return safAck(ack, result);
@@ -116,9 +114,12 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
   });
 
   // ── bingo:claimBingo ───────────────────────────────────────────────────────
-  socket.on('bingo:claimBingo', async ({ telegramId, roomId } = {}, ack) => {
+  socket.on('bingo:claimBingo', async ({ roomId } = {}, ack) => {
+    // SECURITY FIX: identity from verified socket.data
+    const telegramId = socket.data.telegramId;
+
     if (!telegramId || !roomId) {
-      return safAck(ack, { success: false, message: 'Missing telegramId or roomId.' });
+      return safAck(ack, { success: false, message: 'Missing roomId.' });
     }
 
     const room = bingoManager.getRoom(roomId);
@@ -128,9 +129,6 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
 
     const claimResult = await room.claimBingo(telegramId);
 
-    // Bug 2 Fix: _endGame → disburseWinnings already credited the DB.
-    // Do NOT call creditBalance again (would double-pay the winner).
-    // Just fetch the real updated balance and push it to the winner's screen.
     if (claimResult.isWinner) {
       try {
         const updatedWinner = await User.findOne({ telegramId });
@@ -161,9 +159,9 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
   });
 
   // ── bingo:rejoin ───────────────────────────────────────────────────────────
-  // Called on reconnect. Finds the user's active room and sends full game state
-  // back so they can resume without losing progress.
-  socket.on('bingo:rejoin', ({ telegramId } = {}, ack) => {
+  socket.on('bingo:rejoin', (_data, ack) => {
+    // SECURITY FIX: identity from verified socket.data
+    const telegramId = socket.data.telegramId;
     if (!telegramId) return safAck(ack, { success: true, inGame: false });
 
     const allRooms = bingoManager.getAllRooms();
@@ -189,8 +187,6 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
   });
 
 };
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const safAck = (ack, data) => {
   if (typeof ack === 'function') ack(data);
