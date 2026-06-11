@@ -44,6 +44,41 @@ const io = new Server(httpServer, {
 //      emit real-time balance updates to users' open Mini App sessions.
 app.use('/admin/api', makeAdminRouter(io));
 
+// ─── Socket Auth Middleware ───────────────────────────────────────────────────
+// Verifies every socket connection using Telegram's HMAC-SHA256 initData.
+// Sets socket.data.telegramId — all handlers use THIS, never the client value.
+const verifyTelegramInitData = require('./utils/verifyTelegram');
+
+io.use((socket, next) => {
+  const initData = socket.handshake.auth?.initData || '';
+  const BOT_TOKEN = process.env.BOT_TOKEN;
+
+  // Dev mode: allow connections without initData for local testing
+  if (!initData) {
+    if (process.env.NODE_ENV !== 'production') {
+      socket.data.telegramId = 'dev';
+      socket.data.username   = 'DevPlayer';
+      return next();
+    }
+    return next(new Error('MISSING_INIT_DATA'));
+  }
+
+  if (!BOT_TOKEN) {
+    console.error('[Auth] BOT_TOKEN env var not set — cannot verify initData');
+    return next(new Error('SERVER_CONFIG_ERROR'));
+  }
+
+  const user = verifyTelegramInitData(initData, BOT_TOKEN);
+  if (!user) {
+    return next(new Error('INVALID_INIT_DATA'));
+  }
+
+  // Store verified identity on the socket — handlers trust only this
+  socket.data.telegramId = String(user.id);
+  socket.data.username   = user.username || user.first_name || 'Player';
+  next();
+});
+
 // ─── Connect DB ───────────────────────────────────────────────────────────────
 
 connectDB();
