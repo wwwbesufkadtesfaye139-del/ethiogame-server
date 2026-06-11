@@ -1,5 +1,9 @@
 const User        = require('../models/User');
 const Transaction = require('../models/Transaction');
+const { createSocketLimiter } = require('../utils/socketRateLimiter');
+
+// 5 withdrawal attempts per hour per user
+const withdrawLimiter = createSocketLimiter('withdraw', 5, 60 * 60 * 1000);
 
 const registerUserHandlers = (socket, io) => {
 
@@ -64,10 +68,14 @@ const registerUserHandlers = (socket, io) => {
 
   // ── user:requestWithdraw ───────────────────────────────────────────────────
   socket.on('user:requestWithdraw', async ({ amount, phone } = {}, cb) => {
-    // SECURITY FIX: use server-verified telegramId — ignore any client-sent telegramId
     const telegramId = socket.data.telegramId;
     if (!telegramId || !amount || !phone) {
       return cb?.({ success: false, message: 'Missing required fields' });
+    }
+
+    // Rate limit: max 5 withdrawal requests per hour
+    if (!withdrawLimiter(telegramId)) {
+      return cb?.({ success: false, message: 'Too many withdrawal requests. Please wait before trying again.' });
     }
     try {
       const existing = await Transaction.findOne({
