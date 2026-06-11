@@ -49,6 +49,10 @@ class LudoRoom {
     this.brokerFee = 0;
     this.winnerPrize = 0;
 
+    // SECURITY FIX: store server-generated dice rolls here.
+    // movePiece reads from this — the client's diceValue is ignored.
+    this.pendingRolls = {};
+
     this._autoCancelTimer = null;
     this._startAutoCancelTimer();
 
@@ -114,6 +118,9 @@ class LudoRoom {
 
     const diceValue = Math.floor(Math.random() * DICE_SIDES) + 1;
 
+    // SECURITY FIX: persist the roll on the server so movePiece can verify it
+    this.pendingRolls[telegramId] = diceValue;
+
     this.io.to(this.roomId).emit('ludo:diceRolled', {
       roomId: this.roomId,
       telegramId,
@@ -125,9 +132,10 @@ class LudoRoom {
 
     console.log(`[LudoRoom ${this.roomId}] ${currentPlayer.username} rolled ${diceValue}`);
 
-    // If no legal moves, auto-advance turn
+    // If no legal moves, auto-advance turn and clear the pending roll
     if (!this._hasLegalMove(currentPlayer, diceValue)) {
       console.log(`[LudoRoom ${this.roomId}] No legal moves for ${currentPlayer.username}. Skipping turn.`);
+      delete this.pendingRolls[telegramId];
       this._advanceTurn();
     }
 
@@ -141,7 +149,7 @@ class LudoRoom {
    * @param {number} diceValue
    * @returns {Promise<{ success: boolean, newPosition?: number, message: string }>}
    */
-  async movePiece(telegramId, pieceIndex, diceValue) {
+  async movePiece(telegramId, pieceIndex) {
     if (this.state !== 'active') {
       return { success: false, message: 'Game is not active.' };
     }
@@ -153,8 +161,22 @@ class LudoRoom {
       return { success: false, message: 'Invalid piece index.' };
     }
 
+    // SECURITY FIX: use the server-stored dice value — ignore whatever the client sent.
+    // A cheater sending diceValue:6 is completely ignored here.
+    const diceValue = this.pendingRolls[telegramId];
+    if (!diceValue) {
+      return { success: false, message: 'No pending dice roll. Roll the dice first.' };
+    }
+
     const piece = currentPlayer.pieces[pieceIndex];
     const newPosition = this._calculateNewPosition(piece, diceValue, this.players.indexOf(currentPlayer));
+
+    if (newPosition === null) {
+      return { success: false, message: 'Illegal move.' };
+    }
+
+    // Consume the roll — player must roll again next turn
+    delete this.pendingRolls[telegramId];
 
     if (newPosition === null) {
       return { success: false, message: 'Illegal move.' };
