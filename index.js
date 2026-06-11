@@ -15,6 +15,7 @@ const registerLudoHandlers  = require('./socket/ludoHandlers');
 const registerUserHandlers  = require('./socket/userHandlers');
 const makeAdminRouter = require('./adminRoutes');
 const rateLimit = require('express-rate-limit');
+const helmet    = require('helmet');
 
 const PORT = process.env.PORT || 3000;
 const STALE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
@@ -31,6 +32,9 @@ const app = express();
 
 // Trust Railway's proxy so rate limiter sees real client IPs
 app.set('trust proxy', 1);
+
+// Security headers — XSS protection, clickjacking prevention, content sniffing, etc.
+app.use(helmet({ crossOriginResourcePolicy: false }));
 
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '10mb' }));
