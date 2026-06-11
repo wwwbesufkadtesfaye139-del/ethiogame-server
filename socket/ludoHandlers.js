@@ -152,18 +152,19 @@ const registerLudoHandlers = (socket, io, ludoManager) => {
   });
 
   // ── ludo:movePiece ─────────────────────────────────────────────────────────
-  socket.on('ludo:movePiece', async ({ roomId, pieceIndex, diceValue } = {}, ack) => {
-    // SECURITY FIX: identity from verified socket.data
+  socket.on('ludo:movePiece', async ({ roomId, pieceIndex } = {}, ack) => {
+    // SECURITY FIX: diceValue is no longer accepted from the client.
+    // The server reads its own stored pendingRolls value instead.
     const telegramId = socket.data.telegramId;
 
-    if (!telegramId || !roomId || pieceIndex === undefined || !diceValue) {
+    if (!telegramId || !roomId || pieceIndex === undefined) {
       return safAck(ack, { success: false, message: 'Missing move payload.' });
     }
 
     const room = ludoManager.getRoom(roomId);
     if (!room) return safAck(ack, { success: false, message: 'Room not found.' });
 
-    const result = await room.movePiece(telegramId, Number(pieceIndex), Number(diceValue));
+    const result = await room.movePiece(telegramId, Number(pieceIndex));
     safAck(ack, { roomId, ...result });
 
     if (room.state === 'finished' && result.winner) {
