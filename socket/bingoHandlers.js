@@ -21,6 +21,10 @@
  */
 
 const User = require('../models/User');
+const { createSocketLimiter } = require('../utils/socketRateLimiter');
+
+// 20 card purchases per minute per user
+const buyCardLimiter = createSocketLimiter('buyCard', 20, 60 * 1000);
 
 const registerBingoHandlers = (socket, io, bingoManager) => {
   const { id: socketId } = socket;
@@ -62,6 +66,11 @@ const registerBingoHandlers = (socket, io, bingoManager) => {
 
     if (!telegramId || !stake || !cardNumber) {
       return safAck(ack, { success: false, message: 'Missing required fields.' });
+    }
+
+    // Rate limit: max 20 card purchases per minute
+    if (!buyCardLimiter(telegramId)) {
+      return safAck(ack, { success: false, message: 'Too many requests. Please slow down.' });
     }
 
     try {
