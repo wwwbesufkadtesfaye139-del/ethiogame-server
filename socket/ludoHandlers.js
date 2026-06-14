@@ -3,6 +3,9 @@
  * ────────────────
  * SECURITY: telegramId and username come from socket.data (verified by
  *           Telegram initData on connect) — never from event payload.
+ *
+ * BUG FIX: rollDice and movePiece were missing the `room` lookup.
+ *           `room` was used but never assigned — runtime ReferenceError.
  */
 
 const User = require('../models/User');
@@ -17,7 +20,6 @@ const registerLudoHandlers = (socket, io, ludoManager) => {
 
   // ── ludo:createRoom ────────────────────────────────────────────────────────
   socket.on('ludo:createRoom', async ({ maxPlayers, winCondition, stake } = {}, ack) => {
-    // SECURITY FIX: identity from verified socket.data — not from event payload
     const telegramId = socket.data.telegramId;
     const username   = socket.data.username;
 
@@ -29,9 +31,9 @@ const registerLudoHandlers = (socket, io, ludoManager) => {
       const affordCheck = await User.canAffordStake(telegramId, Number(stake));
       if (!affordCheck.canJoin) {
         const messages = {
-          USER_NOT_FOUND:        'User not found.',
-          USER_BLOCKED:          'Your account is blocked.',
-          INSUFFICIENT_BALANCE:  `Insufficient balance. You need ${stake} Birr but have ${affordCheck.balance} Birr.`,
+          USER_NOT_FOUND:       'User not found.',
+          USER_BLOCKED:         'Your account is blocked.',
+          INSUFFICIENT_BALANCE: `Insufficient balance. You need ${stake} Birr but have ${affordCheck.balance} Birr.`,
         };
         return safAck(ack, { success: false, message: messages[affordCheck.reason] || 'Cannot create room.' });
       }
@@ -79,7 +81,6 @@ const registerLudoHandlers = (socket, io, ludoManager) => {
 
   // ── ludo:joinRoom ──────────────────────────────────────────────────────────
   socket.on('ludo:joinRoom', async ({ roomId } = {}, ack) => {
-    // SECURITY FIX: identity from verified socket.data
     const telegramId = socket.data.telegramId;
     const username   = socket.data.username;
 
@@ -96,9 +97,9 @@ const registerLudoHandlers = (socket, io, ludoManager) => {
       const affordCheck = await User.canAffordStake(telegramId, stake);
       if (!affordCheck.canJoin) {
         const messages = {
-          USER_NOT_FOUND:        'User not found.',
-          USER_BLOCKED:          'Your account is blocked.',
-          INSUFFICIENT_BALANCE:  `Insufficient balance. You need ${stake} Birr but have ${affordCheck.balance} Birr.`,
+          USER_NOT_FOUND:       'User not found.',
+          USER_BLOCKED:         'Your account is blocked.',
+          INSUFFICIENT_BALANCE: `Insufficient balance. You need ${stake} Birr but have ${affordCheck.balance} Birr.`,
         };
         return safAck(ack, { success: false, message: messages[affordCheck.reason] || 'Cannot join.' });
       }
@@ -143,7 +144,6 @@ const registerLudoHandlers = (socket, io, ludoManager) => {
 
   // ── ludo:rollDice ──────────────────────────────────────────────────────────
   socket.on('ludo:rollDice', ({ roomId } = {}, ack) => {
-    // SECURITY FIX: identity from verified socket.data
     const telegramId = socket.data.telegramId;
 
     if (!telegramId || !roomId) {
@@ -153,6 +153,9 @@ const registerLudoHandlers = (socket, io, ludoManager) => {
     if (!rollLimiter(telegramId)) {
       return safAck(ack, { success: false, message: 'Too many requests. Please slow down.' });
     }
+
+    // BUG FIX: was missing — `room` used below but never defined
+    const room = ludoManager.getRoom(roomId);
     if (!room) return safAck(ack, { success: false, message: 'Room not found.' });
 
     const result = room.rollDice(telegramId);
@@ -161,8 +164,6 @@ const registerLudoHandlers = (socket, io, ludoManager) => {
 
   // ── ludo:movePiece ─────────────────────────────────────────────────────────
   socket.on('ludo:movePiece', async ({ roomId, pieceIndex } = {}, ack) => {
-    // SECURITY FIX: diceValue is no longer accepted from the client.
-    // The server reads its own stored pendingRolls value instead.
     const telegramId = socket.data.telegramId;
 
     if (!telegramId || !roomId || pieceIndex === undefined) {
@@ -172,6 +173,9 @@ const registerLudoHandlers = (socket, io, ludoManager) => {
     if (!moveLimiter(telegramId)) {
       return safAck(ack, { success: false, message: 'Too many requests. Please slow down.' });
     }
+
+    // BUG FIX: was missing — `room` used below but never defined
+    const room = ludoManager.getRoom(roomId);
     if (!room) return safAck(ack, { success: false, message: 'Room not found.' });
 
     const result = await room.movePiece(telegramId, Number(pieceIndex));
