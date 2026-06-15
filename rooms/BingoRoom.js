@@ -115,17 +115,47 @@ class BingoRoom {
     return { success: true, message: `Card #${cardNumber} purchased!`, card: cardInfo.card };
   }
 
-  removePlayer(socketId) {
+  async removePlayer(socketId) {
     for (const [telegramId, player] of this.players.entries()) {
       if (player.socketId === socketId) {
-        // Only remove if game hasn't started
+        // Only remove/refund if game hasn't started yet
         if (this.state === 'waiting' || this.state === 'countdown') {
-          // Free up their cards
+          const cardCount    = player.ownedCards.length;
+          const refundAmount = +(this.stake * cardCount).toFixed(2);
+
+          // Free up their cards in memory
           for (const cardNumber of player.ownedCards) {
             const cardInfo = this.cards.get(cardNumber);
             if (cardInfo) cardInfo.owner = null;
           }
           this.players.delete(telegramId);
+
+          // ✅ FIX #1 — Refund every Birr the player spent on cards.
+          // Balance was already deducted in bingoHandlers bingo:buyCard.
+          // Without this, disconnecting before game start lost the player's money.
+          if (cardCount > 0) {
+            try {
+              await refundStakes([telegramId], refundAmount);
+              console.log(
+                `[BingoRoom ${this.roomId}] Refunded ${refundAmount} Birr to ` +
+                `${player.username} (${cardCount} card(s) × ${this.stake} Birr) on disconnect.`
+              );
+
+              // Push updated balance to any still-active sessions for this user
+              // (covers multi-device users and very fast reconnects).
+              const updatedUser = await User.findOne({ telegramId });
+              if (updatedUser) {
+                const available = updatedUser.balance - (updatedUser.lockedBalance || 0);
+                this.io
+                  .to(`user:${telegramId}`)
+                  .emit('user:balanceUpdated', { balance: available });
+              }
+            } catch (err) {
+              console.error(
+                `[BingoRoom ${this.roomId}] Refund FAILED for ${telegramId}:`, err.message
+              );
+            }
+          }
 
           this.io.to(this.roomId).emit('bingo:playerLeft', {
             roomId:      this.roomId,
