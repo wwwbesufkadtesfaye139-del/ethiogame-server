@@ -90,11 +90,14 @@ class BingoManager {
     if (swept) console.log(`[BingoManager] Swept ${swept} stale room(s).`);
   }
 
-  handleDisconnect(socketId) {
+  async handleDisconnect(socketId) {
     for (const [roomId, room] of this.rooms.entries()) {
       const hasPlayer = [...room.players.values()].some(p => p.socketId === socketId);
       if (hasPlayer) {
-        room.removePlayer(socketId);
+        // ✅ FIX #1 — must await so the refund completes before we
+        // potentially destroy the room, which would delete player records
+        // needed by refundStakes.
+        await room.removePlayer(socketId);
         if (room.isEmpty() && room.state !== 'active') {
           this.removeRoom(roomId);
         }
