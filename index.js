@@ -276,9 +276,12 @@ io.on('connection', (socket) => {
   registerLudoHandlers(socket, io, ludoManager);
   registerUserHandlers(socket, io);
 
-  socket.on('disconnect', (reason) => {
+  // ✅ FIX #1 — async so the refund DB write in handleDisconnect fully
+  // completes before the process continues. Without await, the refund
+  // was fire-and-forget and could be silently skipped under load.
+  socket.on('disconnect', async (reason) => {
     console.log(`[Socket] Disconnected: ${socket.id} (${reason})`);
-    bingoManager.handleDisconnect(socket.id);
+    await bingoManager.handleDisconnect(socket.id);
     ludoManager.handleDisconnect(socket.id);
   });
 
