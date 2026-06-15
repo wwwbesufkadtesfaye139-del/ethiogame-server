@@ -26,6 +26,28 @@ const registerUserHandlers = (socket, io) => {
     }
   });
 
+  // ── user:getStats ─────────────────────────────────────────────────────────
+  // Returns lifetime stats for the Wallet screen (Total Won, Deposited, Games)
+  socket.on('user:getStats', async (_data, cb) => {
+    const telegramId = socket.data.telegramId;
+    if (!telegramId) return cb?.({ success: false });
+    try {
+      const user = await User.findOne({ telegramId: String(telegramId) });
+      if (!user) return cb?.({ success: false, message: 'User not found' });
+
+      cb?.({
+        success: true,
+        totalWinnings:  user.totalWinnings  || 0,
+        totalDeposited: user.totalDeposited || 0,
+        gamesPlayed:    user.gamesPlayed    || 0,
+        gamesWon:       user.gamesWon       || 0,
+      });
+    } catch (err) {
+      console.error('[userHandlers] getStats error:', err.message);
+      cb?.({ success: false });
+    }
+  });
+
   // ── user:getTransactions ───────────────────────────────────────────────────
   socket.on('user:getTransactions', async (_data, cb) => {
     // SECURITY FIX: use server-verified telegramId — ignore client value
