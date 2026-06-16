@@ -189,12 +189,26 @@ class BingoRoom {
   // ─── Bingo Claim ──────────────────────────────────────────────────────────
 
   async claimBingo(telegramId) {
+    // ✅ FIX #2 — Prevent double-payout race condition.
+    //
+    // The problem: two players can both have valid bingos. Their
+    // socket events arrive milliseconds apart. Player A's handler
+    // passes the `state !== 'active'` check, then hits `await _endGame()`
+    // and yields. Player B's event is processed in that gap — state is
+    // still 'active' — so B also passes the check and calls _endGame a
+    // second time. disburseWinnings fires twice. The winner is paid double.
+    //
+    // The fix: flip state to 'claiming' SYNCHRONOUSLY as the very first
+    // thing, before any card checks or awaits. Any concurrent claim
+    // sees 'claiming' (not 'active') and is immediately rejected.
     if (this.state !== 'active') {
       return { isWinner: false, message: 'Game is not active.' };
     }
+    this.state = 'claiming'; // ← atomic lock — no await between here and _endGame
 
     const player = this.players.get(telegramId);
     if (!player) {
+      this.state = 'active'; // release lock — unknown player, game continues
       return { isWinner: false, message: 'Player not in this room.' };
     }
 
@@ -205,16 +219,19 @@ class BingoRoom {
 
       const { isWinner, pattern } = verifyBingoWin(cardInfo.card, this.calledNumbers);
       if (isWinner) {
-        console.log(`[BingoRoom ${this.roomId}] WINNER: ${player.username} card #${cardNumber} via ${pattern}`);
-        // _endGame → disburseWinnings() credits the DB. We capture winnerPrize
-        // BEFORE calling _endGame so it's available in the return value.
+        console.log(
+          `[BingoRoom ${this.roomId}] WINNER: ${player.username} ` +
+          `card #${cardNumber} via ${pattern}`
+        );
+        // Capture prize before _endGame flips state to 'finished'
         const prize = this.winnerPrize;
-        await this._endGame([telegramId]);
-        // BUG 2 FIX: include winnerPrize so bingoHandlers can push balance update
+        await this._endGame([telegramId]); // state → 'finished' inside here
         return { isWinner: true, pattern, cardNumber, winnerPrize: prize, message: 'Bingo confirmed! 🎉' };
       }
     }
 
+    // Not a winner — release the lock so the game continues normally
+    this.state = 'active';
     return { isWinner: false, message: 'Not a valid Bingo yet — keep playing!' };
   }
 
@@ -341,6 +358,9 @@ class BingoRoom {
   }
 
   async _endGame(winnerTelegramIds) {
+    // Secondary guard — claimBingo already holds 'claiming' lock so this
+    // should never trigger in normal flow, but protects _handleNoWinner
+    // from colliding with a concurrent claim in extreme edge cases.
     if (this.state === 'finished') return;
     this.state = 'finished';
     if (this._drawTimer) clearTimeout(this._drawTimer);
