@@ -184,12 +184,11 @@ app.get('/lobby/ludo', (_req, res) => {
 // ─── POST /deposit/upload ─────────────────────────────────────────────────────
 
 app.post('/deposit/upload', depositLimiter, upload.single('photo'), async (req, res) => {
-  const telegramId = req.body?.telegramId;
-  const username   = req.body?.username || 'Anonymous';
-  const file       = req.file;
+  const file     = req.file;
+  const initData = req.body?.initData;
 
-  if (!file || !telegramId) {
-    return res.status(400).json({ success: false, message: 'Missing photo or telegramId.' });
+  if (!file || !initData) {
+    return res.status(400).json({ success: false, message: 'Missing photo or initData.' });
   }
 
   const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -199,6 +198,26 @@ app.post('/deposit/upload', depositLimiter, upload.single('photo'), async (req, 
     console.error('[deposit/upload] BOT_TOKEN or ADMIN_ID not configured.');
     return res.status(500).json({ success: false, message: 'Server configuration error.' });
   }
+
+  // ✅ FIX #3 — Verify Telegram identity before touching the database.
+  //
+  // Old code read telegramId straight from req.body — any user could POST
+  // with someone else's telegramId and have funds credited to that account.
+  //
+  // We now run the same HMAC-SHA256 check used by the socket auth middleware.
+  // telegramId and username are extracted only from the verified payload,
+  // making identity spoofing impossible without access to the bot token.
+  const verifiedUser = verifyTelegramInitData(initData, BOT_TOKEN);
+  if (!verifiedUser) {
+    console.warn('[deposit/upload] Rejected: invalid or expired initData');
+    return res.status(401).json({
+      success: false,
+      message: 'Invalid or expired Telegram session. Please reopen the app.',
+    });
+  }
+
+  const telegramId = String(verifiedUser.id);
+  const username   = verifiedUser.username || verifiedUser.first_name || 'Anonymous';
 
   try {
     // ── Find or create user ─────────────────────────────────────────────────
