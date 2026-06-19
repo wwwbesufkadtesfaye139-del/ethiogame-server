@@ -1,368 +1,442 @@
-import { createContext, useContext, useEffect, useRef, useState } from 'react';
-import { io } from 'socket.io-client';
+const { calculatePrize, refundStakes, disburseWinnings } = require('../services/BrokerService');
+const GameHistory = require('../models/GameHistory');
 
-import { SERVER_URL } from '../config';
+const AUTO_CANCEL_MS = 120_000;  // 120 seconds to fill the room
+const DICE_SIDES = 6;
+const PIECES_PER_PLAYER = 4;
 
-const GameCtx = createContext(null);
+// Board constants
+const BOARD_PATH_LENGTH = 52;   // main loop cells (0-51)
+const HOME_COLUMN_LENGTH = 5;   // cells 52-56 per player
+const FINISHED_POSITION = 57;   // piece has reached home center
 
-export const GameProvider = ({ children, telegramId: propTelegramId, username }) => {
-  const socketRef    = useRef(null);
-  const [connected,  setConnected]  = useState(false);
-  const [balance,    setBalance]    = useState(0);
-  const [userStats,  setUserStats]  = useState({ totalWinnings: 0, totalDeposited: 0, gamesPlayed: 0, gamesWon: 0 });
-  const [bingoState, setBingoState] = useState(null);
-  const [ludoState,  setLudoState]  = useState(null);
+const PLAYER_COLORS = ['red', 'blue', 'green', 'yellow'];
 
-  // ✅ Get telegramId from prop OR directly from Telegram WebApp
-  const telegramId = String(
-    propTelegramId ||
-    window?.Telegram?.WebApp?.initDataUnsafe?.user?.id ||
-    'dev'
-  );
+// Starting positions on the main path for each color slot
+const START_POSITIONS = { red: 0, blue: 13, green: 26, yellow: 39 };
 
-  useEffect(() => {
-    // SECURITY FIX: send Telegram initData in the socket handshake so the
-    // server can verify our identity with HMAC-SHA256 before trusting anything.
-    const socket = io(SERVER_URL, {
-      transports:   ['websocket', 'polling'],
-      reconnection: true,
-      auth: {
-        initData: window?.Telegram?.WebApp?.initData || '',
-      },
+/**
+ * LudoRoom
+ * ─────────
+ * Lifecycle states:
+ *   'waiting'   → room open, waiting for maxPlayers
+ *   'active'    → all players joined, game in progress
+ *   'finished'  → a winner has met the winCondition
+ *   'cancelled' → auto-cancel fired before room filled
+ */
+class LudoRoom {
+  /**
+   * @param {string}  roomId
+   * @param {object}  creatorInfo  - { telegramId, username, socketId }
+   * @param {number}  maxPlayers   - 2 | 3 | 4
+   * @param {number}  winCondition - number of kings (finished pieces) needed: 1 | 2 | 4
+   * @param {number}  stake        - Birr per player
+   * @param {object}  io           - Socket.io server instance
+   */
+  constructor(roomId, creatorInfo, maxPlayers, winCondition, stake, io) {
+    this.roomId = roomId;
+    this.maxPlayers = maxPlayers;
+    this.winCondition = winCondition;
+    this.stake = stake;
+    this.io = io;
+
+    // Players: { telegramId, username, socketId, color, pieces: [pos, pos, pos, pos] }
+    this.players = [];
+    this.state = 'waiting';
+    this.currentTurnIndex = 0;  // index into this.players
+
+    this.totalPool = 0;
+    this.brokerFee = 0;
+    this.winnerPrize = 0;
+
+    // SECURITY FIX: store server-generated dice rolls here.
+    // movePiece reads from this — the client's diceValue is ignored.
+    this.pendingRolls = {};
+
+    this._autoCancelTimer = null;
+    this._startAutoCancelTimer();
+
+    // Add creator as first player
+    this.addPlayer(creatorInfo);
+  }
+
+  // ─── Public API ─────────────────────────────────────────────────────────────
+
+  /**
+   * @param {{ telegramId, username, socketId }} playerInfo
+   * @returns {{ success: boolean, message: string, color?: string }}
+   */
+  addPlayer(playerInfo) {
+    if (this.state !== 'waiting') {
+      return { success: false, message: 'Room is no longer accepting players.' };
+    }
+    if (this.players.length >= this.maxPlayers) {
+      return { success: false, message: 'Room is full.' };
+    }
+    if (this.players.find((p) => p.telegramId === playerInfo.telegramId)) {
+      return { success: false, message: 'Already in this room.' };
+    }
+
+    const color = PLAYER_COLORS[this.players.length];
+    const pieces = Array(PIECES_PER_PLAYER).fill(-1); // -1 = in base (not started)
+
+    this.players.push({ ...playerInfo, color, pieces });
+
+    console.log(`[LudoRoom ${this.roomId}] Player joined: ${playerInfo.username} as ${color} (${this.players.length}/${this.maxPlayers})`);
+
+    this.io.to(this.roomId).emit('ludo:playerJoined', {
+      roomId: this.roomId,
+      telegramId: playerInfo.telegramId,
+      username: playerInfo.username,
+      color,
+      playerCount: this.players.length,
+      maxPlayers: this.maxPlayers,
     });
-    socketRef.current = socket;
 
-    // Handle auth rejection from server (invalid or expired initData)
-    socket.on('connect_error', (err) => {
-      console.error('[Socket] Auth error:', err.message);
-      setConnected(false);
+    // Start when room is full
+    if (this.players.length === this.maxPlayers) {
+      this._clearAutoCancelTimer();
+      setImmediate(() => this._startGame());
+    }
+
+    return { success: true, message: 'Joined room.', color };
+  }
+
+  /**
+   * Rolls the dice for the current player.
+   * @param {string} telegramId - must match the current turn player
+   * @returns {{ success: boolean, diceValue?: number, message: string }}
+   */
+  rollDice(telegramId) {
+    if (this.state !== 'active') {
+      return { success: false, message: 'Game is not active.' };
+    }
+    const currentPlayer = this.players[this.currentTurnIndex];
+    if (currentPlayer.telegramId !== telegramId) {
+      return { success: false, message: 'Not your turn.' };
+    }
+
+    const diceValue = Math.floor(Math.random() * DICE_SIDES) + 1;
+
+    // SECURITY FIX: persist the roll on the server so movePiece can verify it
+    this.pendingRolls[telegramId] = diceValue;
+
+    this.io.to(this.roomId).emit('ludo:diceRolled', {
+      roomId: this.roomId,
+      telegramId,
+      username: currentPlayer.username,
+      color: currentPlayer.color,
+      diceValue,
+      currentTurnIndex: this.currentTurnIndex,
     });
 
-    // ✅ FIX 1 — When app connects, immediately ask Railway for the REAL balance
-    socket.on('connect', () => {
-      setConnected(true);
-      console.log('Connected to server');
-      // Ask server for real balance right away — no more starting at 0
-      socket.emit('user:getBalance', { telegramId }, (res) => {
-        if (res?.success) {
-          setBalance(res.balance);
-        }
+    console.log(`[LudoRoom ${this.roomId}] ${currentPlayer.username} rolled ${diceValue}`);
+
+    // If no legal moves, auto-advance turn and clear the pending roll
+    if (!this._hasLegalMove(currentPlayer, diceValue)) {
+      console.log(`[LudoRoom ${this.roomId}] No legal moves for ${currentPlayer.username}. Skipping turn.`);
+      delete this.pendingRolls[telegramId];
+      this._advanceTurn();
+    }
+
+    return { success: true, diceValue, message: 'Dice rolled.' };
+  }
+
+  /**
+   * Moves a piece for the current player.
+   * @param {string} telegramId
+   * @param {number} pieceIndex  - 0-3
+   * @param {number} diceValue
+   * @returns {Promise<{ success: boolean, newPosition?: number, message: string }>}
+   */
+  async movePiece(telegramId, pieceIndex) {
+    if (this.state !== 'active') {
+      return { success: false, message: 'Game is not active.' };
+    }
+    const currentPlayer = this.players[this.currentTurnIndex];
+    if (currentPlayer.telegramId !== telegramId) {
+      return { success: false, message: 'Not your turn.' };
+    }
+    if (pieceIndex < 0 || pieceIndex >= PIECES_PER_PLAYER) {
+      return { success: false, message: 'Invalid piece index.' };
+    }
+
+    // SECURITY FIX: use the server-stored dice value — ignore whatever the client sent.
+    // A cheater sending diceValue:6 is completely ignored here.
+    const diceValue = this.pendingRolls[telegramId];
+    if (!diceValue) {
+      return { success: false, message: 'No pending dice roll. Roll the dice first.' };
+    }
+
+    const piece = currentPlayer.pieces[pieceIndex];
+    const newPosition = this._calculateNewPosition(piece, diceValue, this.players.indexOf(currentPlayer));
+
+    if (newPosition === null) {
+      return { success: false, message: 'Illegal move.' };
+    }
+
+    // Consume the roll — player must roll again next turn
+    delete this.pendingRolls[telegramId];
+
+    if (newPosition === null) {
+      return { success: false, message: 'Illegal move.' };
+    }
+
+    currentPlayer.pieces[pieceIndex] = newPosition;
+
+    this.io.to(this.roomId).emit('ludo:pieceMoved', {
+      roomId: this.roomId,
+      telegramId,
+      username: currentPlayer.username,
+      color: currentPlayer.color,
+      pieceIndex,
+      fromPosition: piece,
+      toPosition: newPosition,
+      diceValue,
+      boardState: this._getBoardState(),
+    });
+
+    console.log(
+      `[LudoRoom ${this.roomId}] ${currentPlayer.username} moved piece ${pieceIndex}: ${piece} → ${newPosition}`
+    );
+
+    // Check win condition
+    const kingsCount = currentPlayer.pieces.filter((p) => p === FINISHED_POSITION).length;
+    if (kingsCount >= this.winCondition) {
+      await this._endGame(telegramId);
+      // Bug 9 Fix: return winner so ludoHandlers can fetch updated balance and push it
+      return {
+        success: true,
+        newPosition,
+        message: 'Move made. You win!',
+        winner: { telegramId: currentPlayer.telegramId, socketId: currentPlayer.socketId },
+      };
+    }
+
+    // Only advance turn if dice was not a 6 (reward: roll again on 6)
+    if (diceValue !== 6) {
+      this._advanceTurn();
+    } else {
+      this.io.to(this.roomId).emit('ludo:rollAgain', {
+        roomId: this.roomId,
+        telegramId,
+        message: `${currentPlayer.username} rolled a 6! Roll again.`,
       });
-      // Fetch lifetime stats for the Wallet screen (Total Won, Deposited, Games)
-      socket.emit('user:getStats', { telegramId }, (res) => {
-        if (res?.success) {
-          setUserStats({
-            totalWinnings:  res.totalWinnings,
-            totalDeposited: res.totalDeposited,
-            gamesPlayed:    res.gamesPlayed,
-            gamesWon:       res.gamesWon,
-          });
-        }
-      });
-      // Resume: check if this user is mid-game after reconnect
-      if (telegramId && telegramId !== 'dev') {
-        socket.emit('bingo:rejoin', { telegramId }, (res) => {
-          if (res?.inGame) {
-            setBingoState(prev => ({
-              ...prev,
-              roomId:        res.roomId,
-              stake:         res.stake,
-              calledNumbers: res.calledNumbers,
-              ownedCards:    res.ownedCards,
-              state:         'active',
-              playerCount:   res.playerCount,
-              winnerPrize:   res.winnerPrize,
-            }));
+    }
+
+    return { success: true, newPosition, message: 'Move made.' };
+  }
+
+  getPlayerCount() {
+    return this.players.length;
+  }
+
+  isEmpty() {
+    return this.players.length === 0;
+  }
+
+  // ─── Private ──────────────────────────────────────────────────────────────
+
+  _startAutoCancelTimer() {
+    this._autoCancelTimer = setTimeout(async () => {
+      if (this.state === 'waiting') {
+        this.state = 'cancelled';
+        console.log(`[LudoRoom ${this.roomId}] Auto-cancelled after ${AUTO_CANCEL_MS / 1000}s.`);
+
+        // Bug 6 Fix: Refund every player who already paid their stake.
+        // Before this fix, stakes were silently lost on auto-cancel.
+        const User = require('../models/User');
+        for (const player of this.players) {
+          try {
+            await User.creditBalance(player.telegramId, this.stake);
+            console.log(`[LudoRoom ${this.roomId}] Refunded ${this.stake} Birr to ${player.username}`);
+          } catch (err) {
+            console.error(`[LudoRoom ${this.roomId}] Refund failed for ${player.telegramId}:`, err.message);
           }
-        });
-      }
-    });
+        }
 
-    socket.on('disconnect', () => setConnected(false));
-
-    // ✅ FIX 2 — Listen for balance updates from server (deposit, win, loss)
-    // Whenever Railway changes the balance, the app will hear it and update
-    socket.on('user:balanceUpdated', (d) => {
-      setBalance(d.balance); // always the real number from the database
-    });
-
-    // ─── BINGO EVENTS ────────────────────────────────────────────────────────
-
-    socket.on('bingo:gameStarted', (d) => {
-      setBingoState((p) => ({ ...p, ...d, calledNumbers: [], state: 'active' }));
-      // ✅ FIX 3 — Use server balance if provided, NOT local math
-      // Old (wrong): setBalance(b => b - d.stake)
-      // New (correct): server sends the real new balance
-      if (d.newBalance !== undefined) setBalance(d.newBalance);
-    });
-
-    socket.on('bingo:numberDrawn', (d) =>
-      setBingoState((p) => (p ? { ...p, calledNumbers: d.calledNumbers, lastDrawn: d.drawnNumber } : p))
-    );
-
-    socket.on('bingo:countdown', (d) =>
-      setBingoState((p) => ({ ...p, ...d, state: 'countdown' }))
-    );
-
-    // ✅ FIX #8 — Handle countdown cancellation.
-    //
-    // The server emits this when a player leaves during the countdown
-    // and the room drops below the minimum player count (see
-    // BingoRoom._cancelCountdown). It correctly reverts the ROOM's state
-    // to 'waiting' server-side — but nothing on the client listened,
-    // so the waiting screen kept showing "⏱ Game Starting Soon!" forever
-    // even though the countdown had actually been cancelled and no game
-    // was coming.
-    //
-    // Setting state back to 'waiting' here makes BingoScreen's waiting
-    // view automatically switch its text to "⏳ Waiting for Players…"
-    // (it already branches on bingoState?.state === 'countdown' vs not —
-    // no UI changes needed, just feeding it the truth).
-    socket.on('bingo:countdownCancelled', (d) =>
-      setBingoState((p) => (p ? { ...p, ...d, state: 'waiting' } : p))
-    );
-
-    socket.on('bingo:playerJoined', (d) =>
-      setBingoState((p) => (p ? { ...p, playerCount: d.playerCount } : p))
-    );
-
-    // ✅ FIX #9 — Keep playerCount accurate when someone leaves.
-    //
-    // The server emits 'bingo:playerLeft' with the updated count whenever
-    // a player disconnects during waiting/countdown (see BingoRoom.removePlayer),
-    // but only 'bingo:playerJoined' was ever handled. The waiting screen's
-    // "N player(s) joined" text could only go up, never down — so after a
-    // player left (e.g. right after a countdown cancellation), the count
-    // stayed stale and overcounted until something else happened to refresh it.
-    socket.on('bingo:playerLeft', (d) =>
-      setBingoState((p) => (p ? { ...p, playerCount: d.playerCount } : p))
-    );
-
-    socket.on('bingo:gameOver', (d) => {
-      setBingoState((p) => ({ ...p, ...d, state: 'finished' }));
-      // ✅ Update balance when game ends (win or loss — server sends real amount)
-      if (d.newBalance !== undefined) setBalance(d.newBalance);
-      // Refresh lifetime stats (gamesPlayed, gamesWon, totalWinnings changed)
-      socket.emit('user:getStats', { telegramId }, (res) => {
-        if (res?.success) {
-          setUserStats({
-            totalWinnings:  res.totalWinnings,
-            totalDeposited: res.totalDeposited,
-            gamesPlayed:    res.gamesPlayed,
-            gamesWon:       res.gamesWon,
+        // Notify the creator specifically
+        const creator = this.players[0];
+        if (creator) {
+          this.io.to(creator.socketId).emit('ludo:roomCancelled', {
+            roomId: this.roomId,
+            message: 'Your room was cancelled because no one joined in time.',
           });
         }
-      });
-    });
 
-    // ✅ FIX #7 — Handle the case where all 75 numbers are drawn with no
-    // winner. The server already emits this and refunds every player's
-    // stake (see BingoRoom._handleNoWinner + FIX #5's balance push), but
-    // nothing on the client was listening — players were stuck staring
-    // at a frozen "Game in Progress" screen forever with no explanation.
-    //
-    // We set a distinct 'noWinner' state (rather than reusing 'finished',
-    // which the UI already treats as "someone won") so BingoScreen can
-    // show the correct message. The refunded balance itself arrives
-    // separately via the 'user:balanceUpdated' event already handled above.
-    socket.on('bingo:noWinner', (d) => {
-      setBingoState((p) => ({ ...p, ...d, state: 'noWinner' }));
-    });
-
-    socket.on('bingo:claimResult', (d) => {
-      setBingoState((p) => ({ ...p, claimResult: d }));
-      // ✅ Update balance if player won
-      if (d.newBalance !== undefined) setBalance(d.newBalance);
-    });
-
-    // ─── LUDO EVENTS ─────────────────────────────────────────────────────────
-
-    socket.on('ludo:gameStarted', (d) => {
-      setLudoState((p) => ({ ...p, ...d, state: 'active' }));
-      // ✅ FIX 3 — Use server balance if provided, NOT local math
-      // Old (wrong): setBalance(b => b - d.stake)
-      // New (correct): server sends the real new balance
-      if (d.newBalance !== undefined) setBalance(d.newBalance);
-    });
-
-    socket.on('ludo:diceRolled', (d) =>
-      setLudoState((p) => (p ? { ...p, lastDice: d } : p))
-    );
-
-    socket.on('ludo:pieceMoved', (d) =>
-      setLudoState((p) => (p ? { ...p, boardState: d.boardState, lastMove: d } : p))
-    );
-
-    socket.on('ludo:turnChanged', (d) =>
-      setLudoState((p) => (p ? { ...p, currentTurnTelegramId: d.currentTurnTelegramId } : p))
-    );
-
-    socket.on('ludo:gameOver', (d) => {
-      setLudoState((p) => ({ ...p, ...d, state: 'finished' }));
-      // ✅ Update balance when game ends
-      if (d.newBalance !== undefined) setBalance(d.newBalance);
-      // Refresh lifetime stats (gamesPlayed, gamesWon, totalWinnings changed)
-      socket.emit('user:getStats', { telegramId }, (res) => {
-        if (res?.success) {
-          setUserStats({
-            totalWinnings:  res.totalWinnings,
-            totalDeposited: res.totalDeposited,
-            gamesPlayed:    res.gamesPlayed,
-            gamesWon:       res.gamesWon,
-          });
-        }
-      });
-    });
-
-    socket.on('ludo:roomCancelled', (d) =>
-      setLudoState((p) => ({ ...p, state: 'cancelled', message: d.message }))
-    );
-
-    socket.on('ludo:playerJoined', (d) =>
-      setLudoState((p) => (p ? { ...p, playerCount: d.playerCount } : p))
-    );
-
-    return () => socket.disconnect();
-  }, [telegramId]); // ✅ Added telegramId as dependency so it re-fetches if user changes
-
-  // ─── EMIT HELPER ───────────────────────────────────────────────────────────
-  const emit = (ev, data, cb) => {
-    if (!socketRef.current?.connected) {
-      // ✅ Wait up to 3 seconds for connection before giving up
-      let attempts = 0;
-      const retry = setInterval(() => {
-        attempts++;
-        if (socketRef.current?.connected) {
-          clearInterval(retry);
-          socketRef.current.emit(ev, data, cb);
-        } else if (attempts >= 6) {
-          clearInterval(retry);
-          cb?.({ success: false, message: 'Not connected to server. Please wait.' });
-        }
-      }, 500);
-      return;
-    }
-    socketRef.current.emit(ev, data, cb);
-  };
-
-  // ─── BINGO ACTIONS ─────────────────────────────────────────────────────────
-  const getBingoCards = (stake, cb) =>
-    emit('bingo:getCards', { stake }, cb);
-
-  const buyBingoCard = (stake, cardNumber, cb) =>
-    emit('bingo:buyCard', { telegramId, username, stake, cardNumber }, (res) => {
-      if (res?.success) {
-        setBingoState(prev => {
-          const existingCards = prev?.ownedCards || [];
-          return {
-            ...prev,
-            roomId:      res.roomId,
-            ownedCards:  [...existingCards, { cardNumber: res.cardNumber, card: res.card }],
-            stake,
-            playerCount: res.playerCount,
-            calledNumbers: prev?.calledNumbers || [],
-            state:       prev?.state || 'waiting',
-          };
+        // Notify all others (if any partial joins)
+        this.io.to(this.roomId).emit('ludo:roomCancelled', {
+          roomId: this.roomId,
+          message: 'Room cancelled — not enough players joined.',
         });
-        if (res.newBalance !== undefined) setBalance(res.newBalance);
       }
-      cb?.(res);
-    });
+    }, AUTO_CANCEL_MS);
+  }
 
-  const claimBingo = (roomId, cb) =>
-    emit('bingo:claimBingo', { telegramId, roomId }, cb);
-
-  const leaveGame = () => setBingoState(null);
-
-  // ─── LUDO ACTIONS ──────────────────────────────────────────────────────────
-  const createLudoRoom = (opts, cb) =>
-    emit('ludo:createRoom', { telegramId, username, ...opts }, (res) => {
-      if (res?.success) {
-        setLudoState({
-          roomId: res.roomId,
-          maxPlayers: res.maxPlayers,
-          winCondition: res.winCondition,
-          stake: res.stake,
-          playerCount: 1,
-          state: 'waiting',
-          isCreator: true,
-        });
-        // ✅ Update balance from server response if provided
-        if (res.newBalance !== undefined) setBalance(res.newBalance);
-      }
-      cb?.(res);
-    });
-
-  const joinLudoRoom = (roomId, cb) =>
-    emit('ludo:joinRoom', { telegramId, username, roomId }, (res) => {
-      // ✅ Update balance when joining (stake deducted)
-      if (res?.newBalance !== undefined) setBalance(res.newBalance);
-      cb?.(res);
-    });
-
-  const rollDice  = (roomId, cb) => emit('ludo:rollDice',  { telegramId, roomId }, cb);
-  const movePiece = (roomId, pieceIndex, diceValue, cb) =>
-    emit('ludo:movePiece', { telegramId, roomId, pieceIndex, diceValue }, cb);
-
-  const listLudoRooms = (cb) => emit('ludo:listRooms', {}, cb);
-  const leaveLudoGame = () => setLudoState(null);
-
-  // ─── MANUAL REFRESH (bonus) ────────────────────────────────────────────────
-  // Call this anywhere in your app to force-refresh balance from server
-  const refreshBalance = () => {
-    if (socketRef.current?.connected) {
-      socketRef.current.emit('user:getBalance', { telegramId }, (res) => {
-        if (res?.success) setBalance(res.balance);
-      });
+  _clearAutoCancelTimer() {
+    if (this._autoCancelTimer) {
+      clearTimeout(this._autoCancelTimer);
+      this._autoCancelTimer = null;
     }
-  };
+  }
 
-  // Call this to force-refresh lifetime stats (Total Won, Deposited, Games)
-  const refreshUserStats = () => {
-    if (socketRef.current?.connected) {
-      socketRef.current.emit('user:getStats', { telegramId }, (res) => {
-        if (res?.success) {
-          setUserStats({
-            totalWinnings:  res.totalWinnings,
-            totalDeposited: res.totalDeposited,
-            gamesPlayed:    res.gamesPlayed,
-            gamesWon:       res.gamesWon,
-          });
-        }
-      });
+  async _startGame() {
+    // Stakes were already collected atomically when each player joined/created the room
+    // (in ludoHandlers.js via User.deductBalance). Do NOT collect again here.
+    const { totalPool, brokerFee, winnerPrize } = calculatePrize(this.players.length, this.stake);
+    this.totalPool = totalPool;
+    this.brokerFee = brokerFee;
+    this.winnerPrize = winnerPrize;
+
+    this.state = 'active';
+    this.currentTurnIndex = 0;
+
+    console.log(
+      `[LudoRoom ${this.roomId}] Game started | Players: ${this.players.length} | winCondition: ${this.winCondition} kings | Prize: ${winnerPrize} Birr`
+    );
+
+    this.io.to(this.roomId).emit('ludo:gameStarted', {
+      roomId: this.roomId,
+      players: this.players.map(({ telegramId, username, color, pieces }) => ({
+        telegramId, username, color, pieces,
+      })),
+      stake: this.stake,
+      totalPool,
+      brokerFee,
+      winnerPrize,
+      winCondition: this.winCondition,
+      currentTurnTelegramId: this.players[0].telegramId,
+    });
+  }
+
+  _advanceTurn() {
+    this.currentTurnIndex = (this.currentTurnIndex + 1) % this.players.length;
+    const nextPlayer = this.players[this.currentTurnIndex];
+
+    this.io.to(this.roomId).emit('ludo:turnChanged', {
+      roomId: this.roomId,
+      currentTurnIndex: this.currentTurnIndex,
+      currentTurnTelegramId: nextPlayer.telegramId,
+      username: nextPlayer.username,
+      color: nextPlayer.color,
+    });
+  }
+
+  /**
+   * Calculates the new position for a piece given a dice roll.
+   * Returns null if the move is illegal.
+   *
+   * Rules:
+   *   - Piece in base (-1): only a 6 launches it to START_POSITIONS[color]
+   *   - Piece on main path (0-51): advance by diceValue (wraps around 52)
+   *   - Piece entering home column (52-56): advance within it
+   *   - Piece at position 56: a diceValue of 1 finishes it (57)
+   *
+   * @param {number} position     - current piece position
+   * @param {number} diceValue
+   * @param {number} playerIndex  - player's index (determines color)
+   * @returns {number|null}
+   */
+  _calculateNewPosition(position, diceValue, playerIndex) {
+    const color = PLAYER_COLORS[playerIndex];
+    const startPos = START_POSITIONS[color];
+
+    if (position === -1) {
+      // Piece in base — only a 6 lets it enter the board
+      return diceValue === 6 ? startPos : null;
     }
-  };
 
-  return (
-    <GameCtx.Provider
-      value={{
-        socket: socketRef.current,
-        connected,
-        balance,
-        setBalance,
-        refreshBalance,
-        userStats,
-        refreshUserStats,
-        telegramId,       // Bug 4 Fix: export real telegramId so screens don't hardcode it
-        bingoState,
-        setBingoState,
-        ludoState,
-        setLudoState,
-        getBingoCards,    // ✅ NEW
-        buyBingoCard,     // ✅ NEW
-        claimBingo,
-        leaveGame,
-        createLudoRoom,
-        joinLudoRoom,
-        rollDice,
-        movePiece,
-        listLudoRooms,
-        leaveLudoGame,
-      }}
-    >
-      {children}
-    </GameCtx.Provider>
-  );
-};
+    if (position === FINISHED_POSITION) {
+      // Already a king, can't move
+      return null;
+    }
 
-export const useGame = () => useContext(GameCtx);
+    if (position >= 52) {
+      // In home column (52-56)
+      const newPos = position + diceValue;
+      if (newPos === FINISHED_POSITION) return FINISHED_POSITION;
+      if (newPos > FINISHED_POSITION) return null; // overshot
+      return newPos;
+    }
+
+    // On main path — calculate steps relative to this player's perspective
+    const stepsFromStart = (position - startPos + BOARD_PATH_LENGTH) % BOARD_PATH_LENGTH;
+    const newStepsFromStart = stepsFromStart + diceValue;
+
+    if (newStepsFromStart === BOARD_PATH_LENGTH) {
+      // Entering home column at cell 52
+      return 52;
+    } else if (newStepsFromStart < BOARD_PATH_LENGTH) {
+      return (startPos + newStepsFromStart) % BOARD_PATH_LENGTH;
+    } else {
+      // Move enters home column
+      const homeSteps = newStepsFromStart - BOARD_PATH_LENGTH;
+      const homePos = 52 + homeSteps - 1;
+      if (homePos > FINISHED_POSITION) return null; // overshot
+      if (homePos === FINISHED_POSITION) return FINISHED_POSITION;
+      return homePos;
+    }
+  }
+
+  _hasLegalMove(player, diceValue) {
+    return player.pieces.some((pos, idx) => {
+      const playerIndex = this.players.indexOf(player);
+      return this._calculateNewPosition(pos, diceValue, playerIndex) !== null;
+    });
+  }
+
+  _getBoardState() {
+    return this.players.map(({ telegramId, color, pieces }) => ({ telegramId, color, pieces }));
+  }
+
+  async _endGame(winnerTelegramId) {
+    if (this.state === 'finished') return;
+    this.state = 'finished';
+
+    await disburseWinnings([winnerTelegramId], this.winnerPrize);
+
+    const winner = this.players.find((p) => p.telegramId === winnerTelegramId);
+
+    this.io.to(this.roomId).emit('ludo:gameOver', {
+      roomId: this.roomId,
+      winner: { telegramId: winner.telegramId, username: winner.username, color: winner.color },
+      winnerPrize: this.winnerPrize,
+      winCondition: this.winCondition,
+      boardState: this._getBoardState(),
+    });
+
+    await this._saveHistory([winnerTelegramId]);
+  }
+
+  async _saveHistory(winnerTelegramIds) {
+    try {
+      await GameHistory.create({
+        roomId: this.roomId,
+        gameType: 'ludo',
+        participants: this.players.map((p) => ({
+          telegramId: p.telegramId,
+          username: p.username,
+          stake: this.stake,
+          didWin: winnerTelegramIds.includes(p.telegramId),
+          prizeReceived: winnerTelegramIds.includes(p.telegramId) ? this.winnerPrize : 0,
+        })),
+        totalPool: this.totalPool,
+        brokerFee: this.brokerFee,
+        winnerPrize: this.winnerPrize,
+        winners: winnerTelegramIds,
+        winCondition: this.winCondition,
+        ludoMaxPlayers: this.maxPlayers,
+        gameState: winnerTelegramIds.length ? 'completed' : 'cancelled',
+      });
+    } catch (err) {
+      console.error(`[LudoRoom ${this.roomId}] Failed to save history:`, err.message);
+    }
+  }
+
+  destroy() {
+    this._clearAutoCancelTimer();
+    console.log(`[LudoRoom ${this.roomId}] Room destroyed.`);
+  }
+}
+
+module.exports = LudoRoom;
