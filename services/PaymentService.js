@@ -1,7 +1,9 @@
 const User = require('../models/User');
 const GameSession = require('../models/GameSession');
-
-const BROKER_FEE_PER_PLAYER = 1; // 1 Birr per participant
+// ✅ FIX #4 — Import the canonical fee calculator instead of duplicating
+// the constant. PaymentService previously had its own BROKER_FEE_PER_PLAYER = 1
+// which silently disagreed with BingoRoom's 10% model.
+const { calculatePrize, HOUSE_FEE_PERCENT } = require('./BrokerService');
 
 /**
  * PaymentService
@@ -58,8 +60,8 @@ const checkAllPlayersCanJoin = async (players, stakeAmount) => {
  * Steps:
  *   1. Load the GameSession by roomId to get player list and stake info.
  *   2. Calculate: totalPool = stakeAmount × playerCount
- *                 brokerFee = BROKER_FEE_PER_PLAYER × playerCount
- *                 winnerPrize = totalPool - brokerFee
+ *                 { totalPool, brokerFee, winnerPrize } = calculatePrize(totalPool)
+ *                 (brokerFee is HOUSE_FEE_PERCENT % of the pool — see BrokerService)
  *   3. Credit the winner's balance with winnerPrize (atomic).
  *   4. Increment winner's gamesWon counter and all players' gamesPlayed.
  *   5. Update GameSession to 'completed' with winner and prize info.
@@ -81,9 +83,18 @@ const releaseFunds = async (roomId, winnerTelegramId) => {
 
   const playerCount  = session.players.length;
   const stakeAmount  = session.stakeAmount;
-  const totalPool    = +(playerCount * stakeAmount).toFixed(2);
-  const brokerFee    = +(playerCount * BROKER_FEE_PER_PLAYER).toFixed(2);
-  const winnerPrize  = +(totalPool - brokerFee).toFixed(2);
+
+  // ✅ FIX #4 — Use the shared calculatePrize() instead of the dead
+  // BROKER_FEE_PER_PLAYER constant (it no longer exists — this line
+  // would have thrown "ReferenceError: BROKER_FEE_PER_PLAYER is not
+  // defined" the moment releaseFunds was ever called).
+  const { totalPool, brokerFee, winnerPrize } = calculatePrize(playerCount * stakeAmount);
+
+  // Fee charged to each individual player, for the per-user $inc below.
+  // (HOUSE_FEE_PERCENT is a % of the pool, so this is just the pool fee
+  // divided evenly across participants — used only for bookkeeping stats,
+  // not for the actual prize math above.)
+  const feePerPlayer = +(brokerFee / playerCount).toFixed(2);
 
   // ── 2. Credit winner ─────────────────────────────────────────────────────
   const updatedWinner = await User.findOneAndUpdate(
@@ -92,7 +103,7 @@ const releaseFunds = async (roomId, winnerTelegramId) => {
       $inc: {
         balance:      winnerPrize,
         totalWinnings: winnerPrize,
-        totalBrokerFee: BROKER_FEE_PER_PLAYER, // winner also paid the fee
+        totalBrokerFee: feePerPlayer, // winner also paid their share of the fee
         gamesPlayed:  1,
         gamesWon:     1,
       },
@@ -115,7 +126,7 @@ const releaseFunds = async (roomId, winnerTelegramId) => {
       {
         $inc: {
           gamesPlayed:    1,
-          totalBrokerFee: BROKER_FEE_PER_PLAYER,
+          totalBrokerFee: feePerPlayer,
         },
       }
     );
@@ -192,5 +203,8 @@ module.exports = {
   checkAllPlayersCanJoin,
   releaseFunds,
   refundAllPlayers,
-  BROKER_FEE_PER_PLAYER,
+  // ✅ FIX #4 — Export the real, currently-used constant instead of the
+  // dead BROKER_FEE_PER_PLAYER (which no longer exists and was exporting
+  // `undefined` to any file that imported it).
+  HOUSE_FEE_PERCENT,
 };
