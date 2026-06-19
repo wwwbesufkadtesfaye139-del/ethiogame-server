@@ -274,10 +274,13 @@ class BingoRoom {
     }
 
     // Count total cards bought = total stakes collected
-    const takenCards  = this.getTakenCardCount();
-    const totalPool   = +(takenCards * this.stake).toFixed(2);
-    const brokerFee   = +(totalPool * 0.10).toFixed(2); // 10% house fee
-    const winnerPrize = +(totalPool - brokerFee).toFixed(2);
+    const takenCards = this.getTakenCardCount();
+
+    // ✅ FIX #4 — Use the shared calculatePrize() from BrokerService instead of
+    // the previous hardcoded `totalPool * 0.10` inline calculation.
+    // Both models existed simultaneously with no single source of truth.
+    // Now all game types share the same HOUSE_FEE_PERCENT constant.
+    const { totalPool, brokerFee, winnerPrize } = calculatePrize(takenCards * this.stake);
 
     this.totalPool   = totalPool;
     this.brokerFee   = brokerFee;
@@ -351,7 +354,30 @@ class BingoRoom {
       }
     }
     for (const [telegramId, cardCount] of cardsByOwner.entries()) {
-      await refundStakes([telegramId], this.stake * cardCount);
+      const refundAmount = this.stake * cardCount;
+      await refundStakes([telegramId], refundAmount);
+
+      // ✅ FIX #5 — Push the new balance to the player's open session.
+      //
+      // refundStakes() correctly restores the DB balance, but nothing
+      // told the client. The player's wallet UI kept showing the old
+      // (pre-refund) balance until they manually refreshed the app —
+      // looking exactly like a lost stake even though the money was
+      // safely back in their account.
+      try {
+        const updatedUser = await User.findOne({ telegramId });
+        if (updatedUser) {
+          const available = updatedUser.balance - (updatedUser.lockedBalance || 0);
+          this.io
+            .to(`user:${telegramId}`)
+            .emit('user:balanceUpdated', { balance: available });
+        }
+      } catch (err) {
+        console.error(
+          `[BingoRoom ${this.roomId}] Balance push FAILED for ${telegramId} after noWinner refund:`,
+          err.message
+        );
+      }
     }
 
     await this._saveHistory([]);
