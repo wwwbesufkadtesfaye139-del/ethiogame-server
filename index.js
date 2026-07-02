@@ -1,4 +1,6 @@
-require('dotenv').config();
+// Must be the first require in the entire process — see instrument.js
+// for why. Also loads dotenv, so no separate dotenv.config() call needed.
+const Sentry  = require('./instrument');
 const http    = require('http');
 const express = require('express');
 const cors    = require('cors');
@@ -287,6 +289,12 @@ app.post('/deposit/upload', depositLimiter, upload.single('photo'), async (req, 
   }
 });
 
+// ─── Sentry Express Error Handler ─────────────────────────────────────────────
+// Must come after all routes above, and before any custom error middleware
+// (there isn't one here — each route already handles its own try/catch and
+// sends a response; this is a safety net for anything that slips through).
+Sentry.setupExpressErrorHandler(app);
+
 // ─── Socket.io Connection Handler ─────────────────────────────────────────────
 
 io.on('connection', (socket) => {
@@ -306,7 +314,31 @@ io.on('connection', (socket) => {
 
   socket.on('error', (err) => {
     console.error(`[Socket] Error on ${socket.id}:`, err.message);
+    Sentry.captureException(err, {
+      tags: { source: 'socket' },
+      extra: { socketId: socket.id, telegramId: socket.data?.telegramId },
+    });
   });
+});
+
+// ─── Process-level Safety Net ──────────────────────────────────────────────────
+// Neither of these change existing crash behavior — Node already terminates
+// the process by default when an exception/rejection has no listener. This
+// just makes sure Sentry sees it (with which player/room was involved, where
+// known) before that happens, instead of the error only ever reaching the
+// Railway log tail.
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception:', err);
+  Sentry.captureException(err, { tags: { source: 'uncaughtException' } });
+  // Flush before exiting — an uncaught exception leaves the process in an
+  // undefined state, so we exit right after, same as Node's own default.
+  Sentry.close(2000).finally(() => process.exit(1));
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled rejection:', reason);
+  Sentry.captureException(reason, { tags: { source: 'unhandledRejection' } });
+  Sentry.close(2000).finally(() => process.exit(1));
 });
 
 // ─── Start Server ─────────────────────────────────────────────────────────────
@@ -324,7 +356,7 @@ const shutdown = (signal) => {
   console.log(`\n[Server] Received ${signal}. Shutting down gracefully…`);
   httpServer.close(() => {
     console.log('[Server] HTTP server closed.');
-    process.exit(0);
+    Sentry.close(2000).finally(() => process.exit(0));
   });
 };
 
