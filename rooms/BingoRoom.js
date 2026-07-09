@@ -1,5 +1,5 @@
 const { generateBingoCard, generateDrawPool, verifyBingoWin } = require('../services/BingoVerifier');
-const { calculatePrize, refundStakes, disburseWinnings } = require('../services/BrokerService');
+const { refundStakes, disburseWinnings, BROKER_FEE_PER_PLAYER } = require('../services/BrokerService');
 const User        = require('../models/User');
 const GameHistory = require('../models/GameHistory');
 
@@ -276,11 +276,25 @@ class BingoRoom {
     // Count total cards bought = total stakes collected
     const takenCards = this.getTakenCardCount();
 
-    // ✅ FIX #4 — Use the shared calculatePrize() from BrokerService instead of
-    // the previous hardcoded `totalPool * 0.10` inline calculation.
-    // Both models existed simultaneously with no single source of truth.
-    // Now all game types share the same HOUSE_FEE_PERCENT constant.
-    const { totalPool, brokerFee, winnerPrize } = calculatePrize(takenCards * this.stake);
+    // 🔴 HOTFIX (pre-existing bug, found during Phase 3 review) — the old
+    // code called calculatePrize(takenCards * this.stake) with only ONE
+    // argument, when the function requires (numPlayers, stakePerPlayer).
+    // stakePerPlayer landed as `undefined`, making totalPool and
+    // winnerPrize both NaN for every single Bingo game, and brokerFee
+    // equal to the entire pool instead of 1 Birr per participant.
+    //
+    // The fix isn't just "pass the right arguments" — calculatePrize's
+    // formula multiplies the SAME count into both totalPool and
+    // brokerFee, which only happens to work for Ludo because there it's
+    // exactly 1 stake per player. Bingo's pool has to scale with CARDS
+    // sold (one player can own several), while the fee is meant to scale
+    // with PARTICIPANTS (1 Birr each, per the server's own "Broker fee: 1
+    // Birr per participant" boot message) — two different counts. So we
+    // compute each from its correct count directly, reusing the shared
+    // BROKER_FEE_PER_PLAYER constant rather than re-deriving the fee rate.
+    const totalPool   = takenCards * this.stake;
+    const brokerFee   = this.players.size * BROKER_FEE_PER_PLAYER;
+    const winnerPrize = totalPool - brokerFee;
 
     this.totalPool   = totalPool;
     this.brokerFee   = brokerFee;
