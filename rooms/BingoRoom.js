@@ -1,5 +1,5 @@
 const { generateBingoCard, generateDrawPool, verifyBingoWin } = require('../services/BingoVerifier');
-const { refundStakes, disburseWinnings, BROKER_FEE_PER_PLAYER } = require('../services/BrokerService');
+const { calculatePrize, refundStakes, disburseWinnings } = require('../services/BrokerService');
 const User        = require('../models/User');
 const GameHistory = require('../models/GameHistory');
 
@@ -276,25 +276,20 @@ class BingoRoom {
     // Count total cards bought = total stakes collected
     const takenCards = this.getTakenCardCount();
 
-    // 🔴 HOTFIX (pre-existing bug, found during Phase 3 review) — the old
-    // code called calculatePrize(takenCards * this.stake) with only ONE
-    // argument, when the function requires (numPlayers, stakePerPlayer).
-    // stakePerPlayer landed as `undefined`, making totalPool and
-    // winnerPrize both NaN for every single Bingo game, and brokerFee
-    // equal to the entire pool instead of 1 Birr per participant.
+    // HISTORY: this used to be a hand-rolled calculation right here,
+    // because calculatePrize() used to take (numPlayers, stakePerPlayer)
+    // and Bingo's pool scales with CARDS sold (one player can own
+    // several), not participants — the two counts aren't interchangeable,
+    // which caused a real bug the last time this was "fixed" by just
+    // passing the right arguments (see git history for the gory details).
     //
-    // The fix isn't just "pass the right arguments" — calculatePrize's
-    // formula multiplies the SAME count into both totalPool and
-    // brokerFee, which only happens to work for Ludo because there it's
-    // exactly 1 stake per player. Bingo's pool has to scale with CARDS
-    // sold (one player can own several), while the fee is meant to scale
-    // with PARTICIPANTS (1 Birr each, per the server's own "Broker fee: 1
-    // Birr per participant" boot message) — two different counts. So we
-    // compute each from its correct count directly, reusing the shared
-    // BROKER_FEE_PER_PLAYER constant rather than re-deriving the fee rate.
-    const totalPool   = takenCards * this.stake;
-    const brokerFee   = this.players.size * BROKER_FEE_PER_PLAYER;
-    const winnerPrize = totalPool - brokerFee;
+    // FEE CHANGE (per Besu, July 2026): calculatePrize() now takes
+    // totalPool directly instead of two counts, specifically so this game
+    // just computes its own pool the way it already has to (cards × stake)
+    // and hands that one number over — no ambiguity about which count
+    // means what, for either game.
+    const totalPool = takenCards * this.stake;
+    const { brokerFee, winnerPrize } = calculatePrize(totalPool);
 
     this.totalPool   = totalPool;
     this.brokerFee   = brokerFee;
