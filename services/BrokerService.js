@@ -1,18 +1,30 @@
 const User = require('../models/User');
 
-const BROKER_FEE_PER_PLAYER = 1; // 1 Birr per participant
+// ─────────────────────────────────────────────────────────────────────────
+// FEE CHANGE (per Besu, July 2026): was a flat 1 Birr per participant,
+// regardless of stake size — so a 10 Birr game paid the same house cut as
+// a 200 Birr game. That's a 10% cut at the lowest tier and as little as
+// 0.5% at the highest, which wasn't the intent. Replaced with a straight
+// percentage of the total pool, so the cut scales with the money in play.
+// ─────────────────────────────────────────────────────────────────────────
+const FEE_PERCENT = 0.10; // 10% of the total pool
 
 /**
  * Calculates the prize pool breakdown before any deductions.
  *
- * @param {number} numPlayers
- * @param {number} stakePerPlayer  - Birr each player puts in
+ * Takes totalPool directly rather than (numPlayers, stakePerPlayer) —
+ * Ludo's pool is numPlayers × stake, but Bingo's pool is cardsSold × stake
+ * (one player can hold several cards), so the two counts aren't
+ * interchangeable. Making the caller compute its own totalPool the way it
+ * already has to for its own bookkeeping removes that ambiguity instead of
+ * baking one game's shape into the shared function.
+ *
+ * @param {number} totalPool  - sum of every stake collected for this game
  * @returns {{ totalPool: number, brokerFee: number, winnerPrize: number }}
  */
-const calculatePrize = (numPlayers, stakePerPlayer) => {
-  const totalPool = numPlayers * stakePerPlayer;
-  const brokerFee = numPlayers * BROKER_FEE_PER_PLAYER;
-  const winnerPrize = totalPool - brokerFee;
+const calculatePrize = (totalPool) => {
+  const brokerFee = Math.floor(totalPool * FEE_PERCENT * 100) / 100;
+  const winnerPrize = Math.round((totalPool - brokerFee) * 100) / 100;
   return { totalPool, brokerFee, winnerPrize };
 };
 
@@ -82,4 +94,4 @@ const disburseWinnings = async (winnerTelegramIds, winnerPrize) => {
   );
 };
 
-module.exports = { calculatePrize, collectStakes, refundStakes, disburseWinnings, BROKER_FEE_PER_PLAYER };
+module.exports = { calculatePrize, collectStakes, refundStakes, disburseWinnings, FEE_PERCENT };
