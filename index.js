@@ -347,7 +347,7 @@ httpServer.listen(PORT, () => {
   console.log(`\n🚀 Telegram Gaming Platform running on port ${PORT}`);
   console.log(`   → Bingo: up to 200 concurrent rooms`);
   console.log(`   → Ludo:  2/3/4 player rooms, 120s auto-cancel`);
-  console.log(`   → Broker fee: 1 Birr per participant\n`);
+  console.log(`   → Broker fee: 10% of the total pool\n`);
 });
 
 // ─── Graceful Shutdown ────────────────────────────────────────────────────────
