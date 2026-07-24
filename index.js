@@ -93,9 +93,25 @@ io.use((socket, next) => {
   const initData = socket.handshake.auth?.initData || '';
   const BOT_TOKEN = process.env.BOT_TOKEN;
 
-  // Dev mode: allow connections without initData for local testing
+  // Dev mode: allow connections without initData for LOCAL TESTING ONLY.
+  //
+  // SECURITY (fixed per audit): this used to trigger whenever NODE_ENV
+  // simply wasn't the exact string 'production' — so an unset,
+  // misspelled, or forgotten NODE_ENV (e.g. after a host migration)
+  // would silently let ANY unauthenticated socket in as a fake user.
+  // That's a fail-OPEN default, which is backwards for anything
+  // touching real money.
+  //
+  // Now it requires an explicit opt-in (ALLOW_DEV_AUTH=true) AND a
+  // non-production NODE_ENV — neither alone is enough, so a missing or
+  // misconfigured env var now fails CLOSED instead of open. To test
+  // locally without Telegram initData, set ALLOW_DEV_AUTH=true in your
+  // local .env. Never set it on Railway.
   if (!initData) {
-    if (process.env.NODE_ENV !== 'production') {
+    const devAuthEnabled =
+      process.env.ALLOW_DEV_AUTH === 'true' && process.env.NODE_ENV !== 'production';
+
+    if (devAuthEnabled) {
       socket.data.telegramId = 'dev';
       socket.data.username   = 'DevPlayer';
       return next();
@@ -347,7 +363,15 @@ httpServer.listen(PORT, () => {
   console.log(`\n🚀 Telegram Gaming Platform running on port ${PORT}`);
   console.log(`   → Bingo: up to 200 concurrent rooms`);
   console.log(`   → Ludo:  2/3/4 player rooms, 120s auto-cancel`);
-  console.log(`   → Broker fee: 10% of the total pool\n`);
+  console.log(`   → Broker fee: 10% of the total pool`);
+  if (process.env.ALLOW_DEV_AUTH === 'true') {
+    console.warn(
+      `   → ⚠️  ALLOW_DEV_AUTH=true — unauthenticated dev logins are ` +
+      `possible on this instance. This must NEVER be set on Railway.\n`
+    );
+  } else {
+    console.log(`   → Dev auth bypass: disabled\n`);
+  }
 });
 
 // ─── Graceful Shutdown ────────────────────────────────────────────────────────
