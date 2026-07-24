@@ -283,7 +283,9 @@ class LudoRoom {
   async _startGame() {
     // Stakes were already collected atomically when each player joined/created the room
     // (in ludoHandlers.js via User.deductBalance). Do NOT collect again here.
-    const { totalPool, brokerFee, winnerPrize } = calculatePrize(this.players.length, this.stake);
+    // FEE CHANGE (per Besu, July 2026): calculatePrize() now takes totalPool
+    // directly (see BrokerService.js) rather than (numPlayers, stakePerPlayer).
+    const { totalPool, brokerFee, winnerPrize } = calculatePrize(this.players.length * this.stake);
     this.totalPool = totalPool;
     this.brokerFee = brokerFee;
     this.winnerPrize = winnerPrize;
