@@ -27,7 +27,7 @@ const GameHistorySchema = new mongoose.Schema(
       },
     ],
     totalPool: Number,           // sum of all stakes
-    brokerFee: Number,           // 1 Birr × numPlayers deducted for admin
+    brokerFee: Number,           // 10% of totalPool, platform's cut
     winnerPrize: Number,         // totalPool - brokerFee (split if multiple winners)
     winners: [String],           // telegramIds of winner(s)
     gameState: {
